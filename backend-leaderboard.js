@@ -157,6 +157,9 @@ const FRONTEND_GOLFER_IDS = [
   ["pavon",     "matthieu pavon"],
   ["mcnealy",   "maverick mcnealy"],
   ["gotterup",  "chris gotterup"],
+  ["fowler",    "rickie fowler"],
+  ["rai",       "aaron rai"],
+  ["woodland",  "gary woodland"],
 ];
 const NORMALIZE = (s) =>
   (s || "").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^a-z]/g, "");
@@ -192,13 +195,21 @@ app.get("/api/leaderboard/:majorId", async (req, res) => {
     const players = Array.isArray(data?.live_stats) ? data.live_stats
                   : Array.isArray(data) ? data : [];
     for (const p of players) {
-      const gid = matchGolferId(p.player_name);
-      if (!gid) continue;
+      const matchedGid = matchGolferId(p.player_name);
+      // Unmatched players still come through with a synthetic key so the
+      // frontend can show the full field on its leaderboard. They aren't
+      // pickable for fantasy until added to the curated GOLFERS list.
+      const gid = matchedGid || `dg-${p.dg_id || NORMALIZE(p.player_name)}`;
       const made = p.made_cut !== false;
       const pos  = (typeof p.position === "number")
                  ? (p.tied ? `T${p.position}` : `${p.position}`)
                  : (p.position || "");
       golfers[gid] = {
+        // For unmatched players, ship name+country so the frontend can render
+        // them without a GOLFERS lookup. Matched players ignore these fields.
+        matched:     !!matchedGid,
+        name:        matchedGid ? null : (p.player_name || ""),
+        country:     matchedGid ? null : (p.country || ""),
         position:    pos,
         score:       typeof p.total === "number" ? p.total : null,
         thru:        p.thru ?? "",
