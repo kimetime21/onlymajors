@@ -184,12 +184,31 @@ const GID_TO_DGID = new Map();
 // short id → display name (last seen pretty name)
 const GID_TO_NAME = new Map();
 
+// Hydrates the dg_id ↔ short id reverse maps from a DataGolf player list.
+// Runs unconditionally (no current_round gate) so /api/stats can resolve
+// a short id even when DataGolf's response is missing current_round.
+function hydrateNameMaps(players) {
+  for (const p of players || []) {
+    if (!p?.dg_id) continue;
+    const gid = matchGolferId(p.player_name);
+    if (gid) {
+      DGID_TO_GID.set(p.dg_id, gid);
+      GID_TO_DGID.set(gid, p.dg_id);
+      GID_TO_NAME.set(gid, prettyName(p.player_name));
+    }
+  }
+}
+
 function recordRoundSnapshot(majorId, currentRound, players) {
+  // Always hydrate the reverse maps first — needed by /api/stats regardless
+  // of whether we have a valid round number to snapshot under.
+  hydrateNameMaps(players);
+
   if (!currentRound || currentRound < 1 || currentRound > 4) return;
   SNAPSHOTS[majorId] = SNAPSHOTS[majorId] || {};
   const store = SNAPSHOTS[majorId];
 
-  for (const p of players) {
+  for (const p of players || []) {
     if (!p?.dg_id) continue;
     store[p.dg_id] = store[p.dg_id] || {};
     store[p.dg_id][currentRound] = {
@@ -202,14 +221,30 @@ function recordRoundSnapshot(majorId, currentRound, players) {
       status:    p.made_cut !== false ? "made_cut" : "mc",
       ts:        Date.now(),
     };
+  }
+}
 
-    // Maintain dg_id ↔ short id reverse map for the stats endpoint.
-    const gid = matchGolferId(p.player_name);
-    if (gid) {
-      DGID_TO_GID.set(p.dg_id, gid);
-      GID_TO_DGID.set(gid, p.dg_id);
-      GID_TO_NAME.set(gid, prettyName(p.player_name));
-    }
+// In-play has a different field shape than live-tournament-stats:
+//   p.current_score, p.current_pos, p.prize_money_projected, p.R1..p.R4
+function recordRoundSnapshotInPlay(majorId, currentRound, players) {
+  hydrateNameMaps(players);
+
+  if (!currentRound || currentRound < 1 || currentRound > 4) return;
+  SNAPSHOTS[majorId] = SNAPSHOTS[majorId] || {};
+  const store = SNAPSHOTS[majorId];
+
+  for (const p of players || []) {
+    if (!p?.dg_id) continue;
+    store[p.dg_id] = store[p.dg_id] || {};
+    const pos = typeof p.current_pos === "number" ? `${p.current_pos}` : (p.current_pos || "");
+    store[p.dg_id][currentRound] = {
+      projMoney:  p.prize_money_projected ?? null,
+      finalMoney: p.final_money ?? null,
+      score:      typeof p.current_score === "number" ? p.current_score : null,
+      position:   pos,
+      status:     pos === "MC" || pos === "CUT" ? "mc" : "made_cut",
+      ts:         Date.now(),
+    };
   }
 }
 
@@ -303,43 +338,29 @@ app.get("/api/leaderboard/:majorId", async (req, res) => {
   if (!eventId) return res.status(404).json({ error: `unknown major: ${majorId}` });
 
   try {
+    // /preds/in-play returns: current_pos, current_score, thru,
+    // R1, R2, R3, R4 round scores, prize_money_projected, make_cut probabilities.
+    // This is the right endpoint for "leaderboard with projected money".
     const data = await cached(`lb:${majorId}`, CACHE_TTL, () =>
-      fetchDG("/preds/live-tournament-stats", { stats: "sg_total", display: "value" })
+      fetchDG("/preds/in-play", { tour: "pga", dead_heat: "yes", odds_format: "percent" })
     );
 
-    const players = Array.isArray(data?.live_stats) ? data.live_stats
+    const players = Array.isArray(data?.data) ? data.data
                   : Array.isArray(data) ? data : [];
-    const currentRound = data?.current_round || null;
+    const currentRound = data?.current_round || data?.round || null;
 
-    // Record snapshot for the current round on every fetch. Each subsequent
-    // write to the same (round, player) overwrites — so the last value
-    // before the round increments is the end-of-round value.
-    recordRoundSnapshot(majorId, currentRound, players);
-
-    // If the tournament is mid- or late-round and we never captured the
-    // earlier rounds, retroactively pull score+position from DataGolf for
-    // R1..(currentRound-1). Fire-and-forget — don't block this response.
-    if (currentRound && currentRound > 1) {
-      const need = [];
-      for (let r = 1; r < currentRound; r++) {
-        if (!BACKFILLED.has(`${majorId}:${r}`)) need.push(r);
-      }
-      if (need.length) {
-        backfillRoundsFromDG(majorId, need)
-          .then(s => console.log(`auto-backfill ${majorId}:`, s))
-          .catch(e => console.warn(`auto-backfill ${majorId} failed:`, e.message));
-      }
-    }
+    // Hydrate the dg_id ↔ short id reverse maps + record round-money snapshot.
+    recordRoundSnapshotInPlay(majorId, currentRound, players);
 
     const golfers = {};
     for (const p of players) {
       const matchedGid = matchGolferId(p.player_name);
       const gid = matchedGid || `dg-${p.dg_id || NORMALIZE(p.player_name)}`;
-      const made = p.made_cut !== false;
-      const pos  = (typeof p.position === "number")
-                 ? (p.tied ? `T${p.position}` : `${p.position}`)
-                 : (p.position || "");
-      const rounds = p.dg_id ? getPlayerRounds(majorId, p.dg_id) : { r1: null, r2: null, r3: null, r4: null };
+      const made = p.make_cut !== 0 && p.current_pos !== "MC" && p.current_pos !== "CUT";
+      const pos  = typeof p.current_pos === "number"
+                 ? `${p.current_pos}`
+                 : (p.current_pos || "");
+      const moneyRounds = p.dg_id ? getPlayerRounds(majorId, p.dg_id) : { r1: null, r2: null, r3: null, r4: null };
 
       golfers[gid] = {
         matched:     !!matchedGid,
@@ -347,17 +368,24 @@ app.get("/api/leaderboard/:majorId", async (req, res) => {
         country:     p.country || "",
         dg_id:       p.dg_id || null,
         position:    pos,
-        score:       typeof p.total === "number" ? p.total : null,
+        score:       typeof p.current_score === "number" ? p.current_score : null,
         thru:        p.thru ?? "",
         status:      made ? "made_cut" : "mc",
-        projMoney:   p.proj_money  ?? null,
+        projMoney:   p.prize_money_projected ?? p.proj_money ?? null,
         finalMoney:  p.final_money ?? null,
-        // Per-round projected money snapshots — populated as the tournament
-        // progresses. Frontend merges these into EARN[majorId][gid].r1..r4.
-        r1: rounds.r1,
-        r2: rounds.r2,
-        r3: rounds.r3,
-        r4: rounds.r4,
+        // Per-round projected money — money we've snapshotted as the tournament
+        // progressed. r1/r2/r3 only populate if we were online when each round ended.
+        r1: moneyRounds.r1,
+        r2: moneyRounds.r2,
+        r3: moneyRounds.r3,
+        r4: moneyRounds.r4,
+        // Round-by-round STROKE scores from DataGolf — always available
+        // historically. Frontend can use these in the stats panel even when
+        // money snapshots are missing.
+        r1Score: p.R1 ?? p.r1 ?? null,
+        r2Score: p.R2 ?? p.r2 ?? null,
+        r3Score: p.R3 ?? p.r3 ?? null,
+        r4Score: p.R4 ?? p.r4 ?? null,
       };
     }
     res.json({
@@ -390,20 +418,19 @@ app.get("/api/stats/:majorId/:golferId", async (req, res) => {
       dgId = GID_TO_DGID.get(golferId) || null;
     }
 
-    // Trigger a leaderboard fetch so SNAPSHOTS + reverse maps are warm.
-    // Hydrate UNCONDITIONALLY (cache hit or miss) — the prior implementation
-    // only hydrated inside the .then() which never ran on cache hit, so a
-    // server restart followed by an unrelated /api/stats call would 404.
+    // Hydrate the reverse maps from in-play. Same cache key as /api/leaderboard
+    // since they share the underlying DataGolf call.
     const lbData = await cached(`lb:${majorId}`, CACHE_TTL, () =>
-      fetchDG("/preds/live-tournament-stats", { stats: "sg_total", display: "value" })
+      fetchDG("/preds/in-play", { tour: "pga", dead_heat: "yes", odds_format: "percent" })
     );
-    recordRoundSnapshot(
-      majorId,
-      lbData?.current_round,
-      Array.isArray(lbData?.live_stats) ? lbData.live_stats : []
-    );
+    const lbPlayers = Array.isArray(lbData?.data) ? lbData.data
+                    : Array.isArray(lbData) ? lbData : [];
+    recordRoundSnapshotInPlay(majorId, lbData?.current_round || lbData?.round, lbPlayers);
     if (!dgId) dgId = GID_TO_DGID.get(golferId) || null;
     if (!dgId) return res.status(404).json({ error: `no dg_id resolved for ${golferId}` });
+
+    // Pull this player's row from in-play for native round-by-round scores.
+    const inPlayPlayer = lbPlayers.find(p => p.dg_id === dgId) || {};
 
     // 1. Tournament SG breakdown + traditional stats (event_avg).
     const sgData = await cached(`sg:${majorId}`, STATS_TTL, () =>
@@ -416,17 +443,20 @@ app.get("/api/stats/:majorId/:golferId", async (req, res) => {
     const sgList = Array.isArray(sgData?.live_stats) ? sgData.live_stats : [];
     const sgPlayer = sgList.find(p => p.dg_id === dgId) || {};
 
-    // 2. Round-by-round from our snapshot store (positions, scores, money).
+    // 2. Round-by-round — prefer native R1..R4 from in-play (always available
+    // historically), augment with money snapshots when we have them.
     const roundSnaps = SNAPSHOTS[majorId]?.[dgId] || {};
+    const roundScoreFromInPlay = (r) =>
+      inPlayPlayer[`R${r}`] ?? inPlayPlayer[`r${r}`] ?? null;
     const rounds = [1, 2, 3, 4].map(r => {
       const snap = roundSnaps[r];
-      if (!snap) return { round: r, score: null, scoreToPar: null, position: null, money: null };
       return {
         round: r,
-        scoreToPar: snap.score,           // cumulative score-to-par at end of round
-        position:   snap.position,
-        money:      snap.finalMoney ?? snap.projMoney ?? null,
-        status:     snap.status,
+        roundScore: roundScoreFromInPlay(r),                          // strokes for this round
+        scoreToPar: snap?.score ?? null,                              // cumulative ToPar after this round
+        position:   snap?.position ?? null,                           // pos at end of round
+        money:      snap?.finalMoney ?? snap?.projMoney ?? null,      // proj money at end of round
+        status:     snap?.status ?? null,
       };
     });
 
