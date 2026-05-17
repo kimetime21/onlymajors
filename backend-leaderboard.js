@@ -31,6 +31,7 @@
 
 import express from "express";
 import cors from "cors";
+import pg from "pg";
 
 const PORT      = process.env.PORT || 3001;
 const DG_KEY    = process.env.DATAGOLF_API_KEY;
@@ -39,10 +40,120 @@ const CACHE_TTL = 60_000;          // 60 seconds — be kind to the DataGolf API
 const STATS_TTL = 90_000;          // stats are slower-moving
 const SEASON_TTL = 6 * 60 * 60_000; // 6 hours
 const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || "https://onlymajors.com,https://www.onlymajors.com").split(",");
+const DATABASE_URL = process.env.DATABASE_URL;
 
 if (!DG_KEY) {
   console.error("✖  DATAGOLF_API_KEY env var not set — exiting");
   process.exit(1);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Postgres pool + schema init
+// If DATABASE_URL is unset we fall back to in-memory state.
+// ─────────────────────────────────────────────────────────────
+const pool = DATABASE_URL
+  ? new pg.Pool({
+      connectionString: DATABASE_URL,
+      ssl: DATABASE_URL.includes("railway") ? { rejectUnauthorized: false } : false,
+      max: 4,
+    })
+  : null;
+
+async function initSchema() {
+  if (!pool) {
+    console.warn("⚠  DATABASE_URL not set — running with in-memory state only");
+    return;
+  }
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS picks (
+      team_id    TEXT NOT NULL,
+      major_id   TEXT NOT NULL,
+      starters   JSONB NOT NULL DEFAULT '[]'::jsonb,
+      bench      JSONB NOT NULL DEFAULT '[]'::jsonb,
+      subs       JSONB NOT NULL DEFAULT '[]'::jsonb,
+      submitted  BOOLEAN NOT NULL DEFAULT false,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (team_id, major_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS chat_messages (
+      id         BIGSERIAL PRIMARY KEY,
+      team_id    TEXT NOT NULL,
+      text       TEXT NOT NULL,
+      ts         BIGINT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_ts ON chat_messages (ts);
+
+    CREATE TABLE IF NOT EXISTS round_snapshots (
+      major_id    TEXT NOT NULL,
+      dg_id       BIGINT NOT NULL,
+      round       INT NOT NULL CHECK (round BETWEEN 1 AND 4),
+      proj_money  NUMERIC,
+      final_money NUMERIC,
+      score       NUMERIC,
+      position    TEXT,
+      status      TEXT,
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (major_id, dg_id, round)
+    );
+
+    CREATE TABLE IF NOT EXISTS profiles (
+      team_id      TEXT PRIMARY KEY,
+      display_name TEXT,
+      team_name    TEXT,
+      email        TEXT,
+      updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+  console.log("✓  Postgres schema ready");
+}
+
+initSchema().catch(e => console.error("✖  schema init failed:", e.message));
+
+// Helper: load all persisted snapshots into the in-memory SNAPSHOTS map on boot.
+// Keeps the rest of the codebase unchanged — SNAPSHOTS is still the cache,
+// the DB is just the durable source of truth.
+async function loadSnapshotsFromDB() {
+  if (!pool) return;
+  try {
+    const { rows } = await pool.query(`SELECT * FROM round_snapshots`);
+    for (const r of rows) {
+      SNAPSHOTS[r.major_id] = SNAPSHOTS[r.major_id] || {};
+      SNAPSHOTS[r.major_id][r.dg_id] = SNAPSHOTS[r.major_id][r.dg_id] || {};
+      SNAPSHOTS[r.major_id][r.dg_id][r.round] = {
+        projMoney:  r.proj_money == null ? null : Number(r.proj_money),
+        finalMoney: r.final_money == null ? null : Number(r.final_money),
+        score:      r.score == null ? null : Number(r.score),
+        position:   r.position,
+        status:     r.status,
+        ts:         r.updated_at ? new Date(r.updated_at).getTime() : Date.now(),
+      };
+    }
+    console.log(`✓  loaded ${rows.length} snapshot rows from DB`);
+  } catch (e) {
+    console.error("✖  snapshot load failed:", e.message);
+  }
+}
+
+async function persistSnapshot(majorId, dgId, round, snap) {
+  if (!pool) return;
+  try {
+    await pool.query(
+      `INSERT INTO round_snapshots (major_id, dg_id, round, proj_money, final_money, score, position, status, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+       ON CONFLICT (major_id, dg_id, round)
+       DO UPDATE SET proj_money = EXCLUDED.proj_money,
+                     final_money = EXCLUDED.final_money,
+                     score = EXCLUDED.score,
+                     position = EXCLUDED.position,
+                     status = EXCLUDED.status,
+                     updated_at = NOW()`,
+      [majorId, dgId, round, snap.projMoney, snap.finalMoney, snap.score, snap.position, snap.status]
+    );
+  } catch (e) {
+    console.warn(`snapshot persist failed (${majorId}/${dgId}/r${round}):`, e.message);
+  }
 }
 
 const app = express();
@@ -237,7 +348,7 @@ function recordRoundSnapshotInPlay(majorId, currentRound, players) {
     if (!p?.dg_id) continue;
     store[p.dg_id] = store[p.dg_id] || {};
     const pos = typeof p.current_pos === "number" ? `${p.current_pos}` : (p.current_pos || "");
-    store[p.dg_id][currentRound] = {
+    const snap = {
       projMoney:  p.prize_money_projected ?? null,
       finalMoney: p.final_money ?? null,
       score:      typeof p.current_score === "number" ? p.current_score : null,
@@ -245,6 +356,10 @@ function recordRoundSnapshotInPlay(majorId, currentRound, players) {
       status:     pos === "MC" || pos === "CUT" ? "mc" : "made_cut",
       ts:         Date.now(),
     };
+    store[p.dg_id][currentRound] = snap;
+    // Write through to Postgres (fire-and-forget). On Railway restart, the
+    // snapshot store is rehydrated from DB so round progression is preserved.
+    persistSnapshot(majorId, p.dg_id, currentRound, snap);
   }
 }
 
@@ -556,12 +671,153 @@ app.get("/api/field/:majorId", async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
+// ─────────────────────────────────────────────────────────────
+// Persistence routes — picks, chat, profiles
+// All require Postgres. If pool is null they return 503.
+// ─────────────────────────────────────────────────────────────
+function requireDb(res) {
+  if (!pool) {
+    res.status(503).json({ error: "database not configured" });
+    return false;
+  }
+  return true;
+}
+
+// GET /api/picks                       → all picks for all teams + all majors
+// GET /api/picks/:teamId               → all majors for one team
+// PUT /api/picks/:teamId/:majorId      → set/replace one slot
+//   body: { starters: [], bench: [], subs: [], submitted: bool }
+app.get("/api/picks", async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const { rows } = await pool.query(`SELECT * FROM picks`);
+    // Reshape into nested form the frontend expects:
+    //   { [teamId]: { [majorId]: { starters, bench, subs, submitted } } }
+    const out = {};
+    for (const r of rows) {
+      out[r.team_id] = out[r.team_id] || {};
+      out[r.team_id][r.major_id] = {
+        starters:  r.starters  || [],
+        bench:     r.bench     || [],
+        subs:      r.subs      || [],
+        submitted: r.submitted,
+      };
+    }
+    res.json(out);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/picks/:teamId/:majorId", async (req, res) => {
+  if (!requireDb(res)) return;
+  const { teamId, majorId } = req.params;
+  const { starters = [], bench = [], subs = [], submitted = false } = req.body || {};
+  try {
+    await pool.query(
+      `INSERT INTO picks (team_id, major_id, starters, bench, subs, submitted, updated_at)
+       VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6, NOW())
+       ON CONFLICT (team_id, major_id)
+       DO UPDATE SET starters = EXCLUDED.starters,
+                     bench    = EXCLUDED.bench,
+                     subs     = EXCLUDED.subs,
+                     submitted = EXCLUDED.submitted,
+                     updated_at = NOW()`,
+      [teamId, majorId, JSON.stringify(starters), JSON.stringify(bench), JSON.stringify(subs), submitted]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET  /api/chat                       → last 200 messages, oldest first
+// POST /api/chat                       → { teamId, text } → inserts row
+app.get("/api/chat", async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, team_id AS "teamId", text, ts
+         FROM chat_messages
+        ORDER BY ts DESC
+        LIMIT 200`
+    );
+    res.json(rows.reverse());   // oldest first for UI
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/chat", async (req, res) => {
+  if (!requireDb(res)) return;
+  const { teamId, text } = req.body || {};
+  if (!teamId || !text || !text.trim()) return res.status(400).json({ error: "teamId and text required" });
+  try {
+    const ts = Date.now();
+    const { rows } = await pool.query(
+      `INSERT INTO chat_messages (team_id, text, ts) VALUES ($1, $2, $3)
+       RETURNING id, team_id AS "teamId", text, ts`,
+      [teamId, text.trim().slice(0, 1000), ts]
+    );
+    res.json(rows[0]);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/profiles            → all profiles { [teamId]: { displayName, teamName, email } }
+// PUT /api/profiles/:teamId    → upsert profile
+app.get("/api/profiles", async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const { rows } = await pool.query(`SELECT team_id, display_name, team_name, email FROM profiles`);
+    const out = {};
+    for (const r of rows) {
+      out[r.team_id] = {
+        displayName: r.display_name,
+        teamName:    r.team_name,
+        email:       r.email,
+      };
+    }
+    res.json(out);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/profiles/:teamId", async (req, res) => {
+  if (!requireDb(res)) return;
+  const { teamId } = req.params;
+  const { displayName = null, teamName = null, email = null } = req.body || {};
+  try {
+    await pool.query(
+      `INSERT INTO profiles (team_id, display_name, team_name, email, updated_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (team_id)
+       DO UPDATE SET display_name = EXCLUDED.display_name,
+                     team_name    = EXCLUDED.team_name,
+                     email        = EXCLUDED.email,
+                     updated_at   = NOW()`,
+      [teamId, displayName, teamName, email]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.listen(PORT, async () => {
   console.log(`✓  OnlyMajors backend listening on :${PORT}`);
-  console.log(`   GET /api/leaderboard/:majorId`);
-  console.log(`   GET /api/stats/:majorId/:golferId`);
-  console.log(`   GET /api/backfill/:majorId`);
-  console.log(`   GET /api/field/:majorId`);
-  console.log(`   GET /api/health`);
+  console.log(`   GET    /api/leaderboard/:majorId`);
+  console.log(`   GET    /api/stats/:majorId/:golferId`);
+  console.log(`   GET    /api/backfill/:majorId`);
+  console.log(`   GET    /api/field/:majorId`);
+  console.log(`   GET    /api/picks    PUT /api/picks/:teamId/:majorId`);
+  console.log(`   GET    /api/chat     POST /api/chat`);
+  console.log(`   GET    /api/profiles PUT  /api/profiles/:teamId`);
+  console.log(`   GET    /api/health`);
   console.log(`   CORS allowed: ${ALLOWED_ORIGINS.join(", ")}`);
+  // Wait for the schema to be ready, then rehydrate snapshots from DB.
+  // initSchema started at boot; this just gives it a moment if it's racing.
+  setTimeout(() => loadSnapshotsFromDB(), 1000);
 });
