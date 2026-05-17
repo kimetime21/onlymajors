@@ -51,10 +51,13 @@ if (!DG_KEY) {
 // Postgres pool + schema init
 // If DATABASE_URL is unset we fall back to in-memory state.
 // ─────────────────────────────────────────────────────────────
+// Railway's INTERNAL Postgres (postgres.railway.internal) doesn't use SSL.
+// Railway's PUBLIC Postgres (*.proxy.rlwy.net) requires SSL with relaxed cert
+// checking. Default to no-SSL only for the explicit internal hostname.
 const pool = DATABASE_URL
   ? new pg.Pool({
       connectionString: DATABASE_URL,
-      ssl: DATABASE_URL.includes("railway") ? { rejectUnauthorized: false } : false,
+      ssl: DATABASE_URL.includes(".railway.internal") ? false : { rejectUnauthorized: false },
       max: 4,
     })
   : null;
@@ -160,7 +163,9 @@ const app = express();
 app.use(cors({
   origin: (origin, callback) => {
     if (ALLOWED_ORIGINS.includes("*"))    return callback(null, true);
-    if (!origin)                           return callback(null, true);
+    // file:// previews and server-to-server requests have either no Origin
+    // header or the literal string "null". Allow both during prototype life.
+    if (!origin || origin === "null")     return callback(null, true);
     if (ALLOWED_ORIGINS.includes(origin))  return callback(null, true);
     callback(new Error(`CORS: ${origin} not in allow-list`));
   },
