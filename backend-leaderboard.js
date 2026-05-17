@@ -221,6 +221,69 @@ function getPlayerRounds(majorId, dgId) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Historical-round backfill
+// ─────────────────────────────────────────────────────────────
+// DataGolf's live-tournament-stats accepts round=1..4 for per-round views.
+// We use that to retroactively populate score/position into SNAPSHOTS for
+// rounds the server missed (e.g. if the server came up mid-tournament).
+// Projected money is NOT available historically — it's a live snapshot —
+// so r1/r2/r3 money stays null. Only score + position can be recovered.
+// ─────────────────────────────────────────────────────────────
+const BACKFILLED = new Set();   // "<majorId>:<round>" markers
+
+async function backfillRoundsFromDG(majorId, rounds = [1, 2, 3]) {
+  const summary = {};
+  for (const round of rounds) {
+    const marker = `${majorId}:${round}`;
+    if (BACKFILLED.has(marker)) {
+      summary[`r${round}`] = "already_backfilled";
+      continue;
+    }
+    try {
+      const data = await fetchDG("/preds/live-tournament-stats", {
+        stats: "sg_total",
+        display: "value",
+        round: String(round),
+      });
+      const players = Array.isArray(data?.live_stats) ? data.live_stats : [];
+      let count = 0;
+      for (const p of players) {
+        if (!p.dg_id) continue;
+        SNAPSHOTS[majorId] = SNAPSHOTS[majorId] || {};
+        SNAPSHOTS[majorId][p.dg_id] = SNAPSHOTS[majorId][p.dg_id] || {};
+        // Don't overwrite a live snapshot — only fill empty slots.
+        if (SNAPSHOTS[majorId][p.dg_id][round]) continue;
+        const pos = typeof p.position === "number"
+                  ? (p.tied ? `T${p.position}` : `${p.position}`)
+                  : (p.position || "");
+        SNAPSHOTS[majorId][p.dg_id][round] = {
+          projMoney: null,      // not historically recoverable
+          finalMoney: null,
+          score:     typeof p.total === "number" ? p.total : null,
+          position:  pos,
+          status:    p.made_cut !== false ? "made_cut" : "mc",
+          backfilled: true,
+          ts: Date.now(),
+        };
+        count++;
+        // Hydrate reverse maps from backfill players too.
+        const gid = matchGolferId(p.player_name);
+        if (gid) {
+          DGID_TO_GID.set(p.dg_id, gid);
+          GID_TO_DGID.set(gid, p.dg_id);
+          GID_TO_NAME.set(gid, prettyName(p.player_name));
+        }
+      }
+      BACKFILLED.add(marker);
+      summary[`r${round}`] = `filled ${count} players`;
+    } catch (e) {
+      summary[`r${round}_error`] = e.message;
+    }
+  }
+  return summary;
+}
+
+// ─────────────────────────────────────────────────────────────
 // Routes
 // ─────────────────────────────────────────────────────────────
 app.get("/api/health", (req, res) => {
@@ -252,6 +315,21 @@ app.get("/api/leaderboard/:majorId", async (req, res) => {
     // write to the same (round, player) overwrites — so the last value
     // before the round increments is the end-of-round value.
     recordRoundSnapshot(majorId, currentRound, players);
+
+    // If the tournament is mid- or late-round and we never captured the
+    // earlier rounds, retroactively pull score+position from DataGolf for
+    // R1..(currentRound-1). Fire-and-forget — don't block this response.
+    if (currentRound && currentRound > 1) {
+      const need = [];
+      for (let r = 1; r < currentRound; r++) {
+        if (!BACKFILLED.has(`${majorId}:${r}`)) need.push(r);
+      }
+      if (need.length) {
+        backfillRoundsFromDG(majorId, need)
+          .then(s => console.log(`auto-backfill ${majorId}:`, s))
+          .catch(e => console.warn(`auto-backfill ${majorId} failed:`, e.message));
+      }
+    }
 
     const golfers = {};
     for (const p of players) {
@@ -312,14 +390,17 @@ app.get("/api/stats/:majorId/:golferId", async (req, res) => {
       dgId = GID_TO_DGID.get(golferId) || null;
     }
 
-    // Trigger a leaderboard fetch first so SNAPSHOTS + reverse maps are warm.
-    // If golferId is short and we have no dg_id yet, this hydrates it.
-    await cached(`lb:${majorId}`, CACHE_TTL, () =>
+    // Trigger a leaderboard fetch so SNAPSHOTS + reverse maps are warm.
+    // Hydrate UNCONDITIONALLY (cache hit or miss) — the prior implementation
+    // only hydrated inside the .then() which never ran on cache hit, so a
+    // server restart followed by an unrelated /api/stats call would 404.
+    const lbData = await cached(`lb:${majorId}`, CACHE_TTL, () =>
       fetchDG("/preds/live-tournament-stats", { stats: "sg_total", display: "value" })
-        .then(d => {
-          recordRoundSnapshot(majorId, d?.current_round, d?.live_stats || []);
-          return d;
-        })
+    );
+    recordRoundSnapshot(
+      majorId,
+      lbData?.current_round,
+      Array.isArray(lbData?.live_stats) ? lbData.live_stats : []
     );
     if (!dgId) dgId = GID_TO_DGID.get(golferId) || null;
     if (!dgId) return res.status(404).json({ error: `no dg_id resolved for ${golferId}` });
@@ -408,6 +489,25 @@ app.get("/api/stats/:majorId/:golferId", async (req, res) => {
   }
 });
 
+// Manual backfill trigger — useful for one-shot use:
+//   curl https://onlymajors-production.up.railway.app/api/backfill/pga
+// Returns a per-round summary of how many players we filled.
+app.get("/api/backfill/:majorId", async (req, res) => {
+  const majorId = req.params.majorId;
+  if (!DG_EVENT_IDS[majorId]) return res.status(404).json({ error: `unknown major: ${majorId}` });
+  // Optional ?rounds=1,2,3 — defaults to 1,2,3.
+  const rounds = (req.query.rounds || "1,2,3")
+    .split(",")
+    .map(s => parseInt(s.trim(), 10))
+    .filter(r => r >= 1 && r <= 4);
+  try {
+    const summary = await backfillRoundsFromDG(majorId, rounds);
+    res.json({ ok: true, majorId, rounds, summary });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 app.get("/api/field/:majorId", async (req, res) => {
   const majorId = req.params.majorId;
   const eventId = DG_EVENT_IDS[majorId];
@@ -430,6 +530,7 @@ app.listen(PORT, () => {
   console.log(`✓  OnlyMajors backend listening on :${PORT}`);
   console.log(`   GET /api/leaderboard/:majorId`);
   console.log(`   GET /api/stats/:majorId/:golferId`);
+  console.log(`   GET /api/backfill/:majorId`);
   console.log(`   GET /api/field/:majorId`);
   console.log(`   GET /api/health`);
   console.log(`   CORS allowed: ${ALLOWED_ORIGINS.join(", ")}`);
