@@ -32,6 +32,7 @@
 import express from "express";
 import cors from "cors";
 import pg from "pg";
+import crypto from "crypto";
 
 const PORT      = process.env.PORT || 3001;
 const DG_KEY    = process.env.DATAGOLF_API_KEY;
@@ -39,8 +40,10 @@ const DG_BASE   = "https://feeds.datagolf.com";
 const CACHE_TTL = 60_000;          // 60 seconds — be kind to the DataGolf API
 const STATS_TTL = 90_000;          // stats are slower-moving
 const SEASON_TTL = 6 * 60 * 60_000; // 6 hours
+const SESSION_TTL_DAYS = 30;
 const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || "https://onlymajors.com,https://www.onlymajors.com").split(",");
 const DATABASE_URL = process.env.DATABASE_URL;
+const DEFAULT_LEAGUE_ID = 1;       // "Experts PGA Fantasy" — auto-seeded on first boot
 
 if (!DG_KEY) {
   console.error("✖  DATAGOLF_API_KEY env var not set — exiting");
@@ -67,7 +70,46 @@ async function initSchema() {
     console.warn("⚠  DATABASE_URL not set — running with in-memory state only");
     return;
   }
+  // Base tables (idempotent)
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS leagues (
+      id           BIGSERIAL PRIMARY KEY,
+      name         TEXT NOT NULL,
+      invite_code  TEXT UNIQUE,
+      format       TEXT NOT NULL DEFAULT 'season_money',
+      scope        TEXT NOT NULL DEFAULT 'season',
+      major_id     TEXT,
+      created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS users (
+      id            BIGSERIAL PRIMARY KEY,
+      email         TEXT UNIQUE NOT NULL,
+      password_hash TEXT NOT NULL,
+      display_name  TEXT,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    CREATE TABLE IF NOT EXISTS league_members (
+      id          BIGSERIAL PRIMARY KEY,
+      league_id   BIGINT NOT NULL REFERENCES leagues(id) ON DELETE CASCADE,
+      user_id     BIGINT REFERENCES users(id) ON DELETE CASCADE,
+      team_id     TEXT NOT NULL,
+      team_name   TEXT,
+      team_color  TEXT,
+      role        TEXT NOT NULL DEFAULT 'member',
+      joined_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (league_id, team_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_league_members_user ON league_members (user_id);
+
+    CREATE TABLE IF NOT EXISTS sessions (
+      token       TEXT PRIMARY KEY,
+      user_id     BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      expires_at  TIMESTAMPTZ NOT NULL,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
     CREATE TABLE IF NOT EXISTS picks (
       team_id    TEXT NOT NULL,
       major_id   TEXT NOT NULL,
@@ -109,7 +151,60 @@ async function initSchema() {
       updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
-  console.log("✓  Postgres schema ready");
+
+  // Migrations: add league_id to picks + chat_messages (idempotent).
+  await pool.query(`
+    ALTER TABLE picks
+      ADD COLUMN IF NOT EXISTS league_id BIGINT NOT NULL DEFAULT 1
+        REFERENCES leagues(id) ON DELETE CASCADE;
+    ALTER TABLE chat_messages
+      ADD COLUMN IF NOT EXISTS league_id BIGINT NOT NULL DEFAULT 1
+        REFERENCES leagues(id) ON DELETE CASCADE;
+  `);
+  // Replace picks PRIMARY KEY to include league_id (only if not already done).
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+         WHERE table_name='picks'
+           AND constraint_type='PRIMARY KEY'
+           AND constraint_name='picks_pkey'
+      ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.key_column_usage
+         WHERE table_name='picks'
+           AND constraint_name='picks_pkey'
+           AND column_name='league_id'
+      ) THEN
+        ALTER TABLE picks DROP CONSTRAINT picks_pkey;
+        ALTER TABLE picks ADD PRIMARY KEY (league_id, team_id, major_id);
+      END IF;
+    END $$;
+  `);
+
+  // Seed the default league + 5 team slots if not already present.
+  await pool.query(`
+    INSERT INTO leagues (id, name, invite_code, format, scope)
+    VALUES (1, 'Experts PGA Fantasy', 'EXPERTS', 'season_money', 'season')
+    ON CONFLICT (id) DO NOTHING;
+    SELECT setval('leagues_id_seq', GREATEST((SELECT MAX(id) FROM leagues), 1));
+  `);
+  for (const [teamId, teamName, color] of [
+    ["thorne", "Team Thorne", "#3A5F8A"],
+    ["larry",  "Team Larry",  "#8A3A3A"],
+    ["boo",    "Team Boo",    "#3A8A5A"],
+    ["caleb",  "Team Caleb",  "#8A6A3A"],
+    ["austin", "Team Austin", "#5A3A8A"],
+  ]) {
+    await pool.query(
+      `INSERT INTO league_members (league_id, team_id, team_name, team_color)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (league_id, team_id) DO NOTHING`,
+      [1, teamId, teamName, color]
+    );
+  }
+
+  console.log("✓  Postgres schema ready · default league seeded");
 }
 
 initSchema().catch(e => console.error("✖  schema init failed:", e.message));
@@ -169,8 +264,67 @@ app.use(cors({
     if (ALLOWED_ORIGINS.includes(origin))  return callback(null, true);
     callback(new Error(`CORS: ${origin} not in allow-list`));
   },
+  allowedHeaders: ["Content-Type", "Authorization"],
 }));
 app.use(express.json());
+
+// ─────────────────────────────────────────────────────────────
+// Auth helpers — scrypt password hashing + opaque session tokens
+// ─────────────────────────────────────────────────────────────
+function hashPassword(plain) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.scryptSync(plain, salt, 64).toString("hex");
+  return `${salt}:${hash}`;
+}
+function verifyPassword(plain, stored) {
+  if (!stored || !stored.includes(":")) return false;
+  const [salt, hash] = stored.split(":");
+  const candidate = crypto.scryptSync(plain, salt, 64);
+  const expected = Buffer.from(hash, "hex");
+  if (candidate.length !== expected.length) return false;
+  return crypto.timingSafeEqual(candidate, expected);
+}
+function newSessionToken() {
+  return crypto.randomBytes(32).toString("hex");
+}
+function isValidEmail(s) {
+  return typeof s === "string" && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+}
+
+// Attach user info to req if a valid Bearer token is present. Does NOT
+// reject — that's done by requireAuth on protected routes.
+async function authContext(req, _res, next) {
+  if (!pool) return next();
+  const header = req.headers.authorization || "";
+  const token = header.replace(/^Bearer\s+/i, "").trim();
+  if (!token) return next();
+  try {
+    const { rows } = await pool.query(
+      `SELECT u.id AS user_id, u.email, u.display_name, s.expires_at
+         FROM sessions s JOIN users u ON u.id = s.user_id
+        WHERE s.token = $1 AND s.expires_at > NOW()`,
+      [token]
+    );
+    if (rows.length === 1) {
+      req.user = {
+        id:          Number(rows[0].user_id),
+        email:       rows[0].email,
+        displayName: rows[0].display_name,
+      };
+      req.token = token;
+    }
+  } catch (e) {
+    console.warn("authContext lookup failed:", e.message);
+  }
+  next();
+}
+app.use(authContext);
+
+function requireAuth(req, res, next) {
+  if (!pool) return next();  // dev mode — no DB, no auth
+  if (!req.user) return res.status(401).json({ error: "auth required" });
+  next();
+}
 
 // ─────────────────────────────────────────────────────────────
 // Major ID → DataGolf event_id mapping
@@ -811,6 +965,193 @@ app.put("/api/profiles/:teamId", async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────
+// Auth routes — signup, login, logout, /me, /leagues/mine
+// ─────────────────────────────────────────────────────────────
+// Helper: return current user + their league memberships
+async function meAndLeagues(userId) {
+  const userRow = (await pool.query(
+    `SELECT id, email, display_name FROM users WHERE id = $1`, [userId]
+  )).rows[0];
+  const leagueRows = (await pool.query(
+    `SELECT l.id, l.name, l.invite_code, l.format, l.scope, l.major_id,
+            lm.team_id, lm.team_name, lm.team_color, lm.role
+       FROM league_members lm
+       JOIN leagues l ON l.id = lm.league_id
+      WHERE lm.user_id = $1
+      ORDER BY lm.joined_at ASC`,
+    [userId]
+  )).rows;
+  return {
+    user: {
+      id:          Number(userRow.id),
+      email:       userRow.email,
+      displayName: userRow.display_name,
+    },
+    leagues: leagueRows.map(r => ({
+      id:        Number(r.id),
+      name:      r.name,
+      inviteCode: r.invite_code,
+      format:    r.format,
+      scope:     r.scope,
+      majorId:   r.major_id,
+      teamId:    r.team_id,
+      teamName:  r.team_name,
+      teamColor: r.team_color,
+      role:      r.role,
+    })),
+  };
+}
+
+// POST /api/auth/signup
+//   body: { email, password, displayName, teamId, leagueCode? }
+//   - creates user
+//   - joins league by code (defaults to "EXPERTS") and claims the given team
+//   - returns { token, user, leagues }
+app.post("/api/auth/signup", async (req, res) => {
+  if (!requireDb(res)) return;
+  const { email, password, displayName, teamId, leagueCode = "EXPERTS" } = req.body || {};
+  if (!isValidEmail(email))            return res.status(400).json({ error: "invalid email" });
+  if (!password || password.length < 6) return res.status(400).json({ error: "password must be at least 6 characters" });
+  if (!displayName || !displayName.trim()) return res.status(400).json({ error: "displayName required" });
+  if (!teamId)                          return res.status(400).json({ error: "teamId required" });
+
+  const normalizedEmail = email.trim().toLowerCase();
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    // Ensure email isn't already taken.
+    const exists = await client.query(`SELECT 1 FROM users WHERE email = $1`, [normalizedEmail]);
+    if (exists.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "email already registered" });
+    }
+    // Resolve league.
+    const lr = await client.query(`SELECT id FROM leagues WHERE invite_code = $1`, [leagueCode]);
+    if (!lr.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: `unknown league code: ${leagueCode}` });
+    }
+    const leagueId = Number(lr.rows[0].id);
+    // Check team slot is unclaimed.
+    const slot = await client.query(
+      `SELECT id, user_id FROM league_members WHERE league_id = $1 AND team_id = $2`,
+      [leagueId, teamId]
+    );
+    if (!slot.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: `team ${teamId} not in league ${leagueCode}` });
+    }
+    if (slot.rows[0].user_id) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: `team ${teamId} already claimed` });
+    }
+    // Create user.
+    const u = await client.query(
+      `INSERT INTO users (email, password_hash, display_name)
+       VALUES ($1, $2, $3) RETURNING id`,
+      [normalizedEmail, hashPassword(password), displayName.trim()]
+    );
+    const userId = Number(u.rows[0].id);
+    // Claim the team slot.
+    await client.query(
+      `UPDATE league_members SET user_id = $1 WHERE id = $2`,
+      [userId, slot.rows[0].id]
+    );
+    // Create session.
+    const token = newSessionToken();
+    const expires = new Date(Date.now() + SESSION_TTL_DAYS * 24 * 60 * 60 * 1000);
+    await client.query(
+      `INSERT INTO sessions (token, user_id, expires_at) VALUES ($1, $2, $3)`,
+      [token, userId, expires]
+    );
+    await client.query("COMMIT");
+    const payload = await meAndLeagues(userId);
+    res.json({ token, ...payload });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("signup failed:", err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// POST /api/auth/login  { email, password } → { token, user, leagues }
+app.post("/api/auth/login", async (req, res) => {
+  if (!requireDb(res)) return;
+  const { email, password } = req.body || {};
+  if (!isValidEmail(email) || !password) return res.status(400).json({ error: "email + password required" });
+  try {
+    const { rows } = await pool.query(
+      `SELECT id, password_hash FROM users WHERE email = $1`,
+      [email.trim().toLowerCase()]
+    );
+    if (!rows.length || !verifyPassword(password, rows[0].password_hash)) {
+      return res.status(401).json({ error: "incorrect email or password" });
+    }
+    const userId = Number(rows[0].id);
+    const token = newSessionToken();
+    const expires = new Date(Date.now() + SESSION_TTL_DAYS * 24 * 60 * 60 * 1000);
+    await pool.query(
+      `INSERT INTO sessions (token, user_id, expires_at) VALUES ($1, $2, $3)`,
+      [token, userId, expires]
+    );
+    const payload = await meAndLeagues(userId);
+    res.json({ token, ...payload });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/auth/logout — invalidates the current session
+app.post("/api/auth/logout", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    await pool.query(`DELETE FROM sessions WHERE token = $1`, [req.token]);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/me  → { user, leagues }
+app.get("/api/me", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const payload = await meAndLeagues(req.user.id);
+    res.json(payload);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/leagues/:leagueId/members — public list of who's in which team slot
+app.get("/api/leagues/:leagueId/members", async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const { rows } = await pool.query(
+      `SELECT lm.team_id, lm.team_name, lm.team_color, lm.user_id,
+              u.display_name, u.email
+         FROM league_members lm
+         LEFT JOIN users u ON u.id = lm.user_id
+        WHERE lm.league_id = $1
+        ORDER BY lm.joined_at ASC`,
+      [req.params.leagueId]
+    );
+    res.json(rows.map(r => ({
+      teamId:       r.team_id,
+      teamName:     r.team_name,
+      teamColor:    r.team_color,
+      claimed:      r.user_id != null,
+      displayName:  r.display_name,
+      email:        r.email,
+    })));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(PORT, async () => {
   console.log(`✓  OnlyMajors backend listening on :${PORT}`);
   console.log(`   GET    /api/leaderboard/:majorId`);
@@ -820,6 +1161,8 @@ app.listen(PORT, async () => {
   console.log(`   GET    /api/picks    PUT /api/picks/:teamId/:majorId`);
   console.log(`   GET    /api/chat     POST /api/chat`);
   console.log(`   GET    /api/profiles PUT  /api/profiles/:teamId`);
+  console.log(`   POST   /api/auth/signup  /api/auth/login  /api/auth/logout`);
+  console.log(`   GET    /api/me  /api/leagues/:id/members`);
   console.log(`   GET    /api/health`);
   console.log(`   CORS allowed: ${ALLOWED_ORIGINS.join(", ")}`);
   // Wait for the schema to be ready, then rehydrate snapshots from DB.
