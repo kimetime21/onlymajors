@@ -152,37 +152,8 @@ async function initSchema() {
     );
   `);
 
-  // Migrations: add league_id to picks + chat_messages (idempotent).
-  await pool.query(`
-    ALTER TABLE picks
-      ADD COLUMN IF NOT EXISTS league_id BIGINT NOT NULL DEFAULT 1
-        REFERENCES leagues(id) ON DELETE CASCADE;
-    ALTER TABLE chat_messages
-      ADD COLUMN IF NOT EXISTS league_id BIGINT NOT NULL DEFAULT 1
-        REFERENCES leagues(id) ON DELETE CASCADE;
-  `);
-  // Replace picks PRIMARY KEY to include league_id (only if not already done).
-  await pool.query(`
-    DO $$
-    BEGIN
-      IF EXISTS (
-        SELECT 1 FROM information_schema.table_constraints
-         WHERE table_name='picks'
-           AND constraint_type='PRIMARY KEY'
-           AND constraint_name='picks_pkey'
-      ) AND NOT EXISTS (
-        SELECT 1 FROM information_schema.key_column_usage
-         WHERE table_name='picks'
-           AND constraint_name='picks_pkey'
-           AND column_name='league_id'
-      ) THEN
-        ALTER TABLE picks DROP CONSTRAINT picks_pkey;
-        ALTER TABLE picks ADD PRIMARY KEY (league_id, team_id, major_id);
-      END IF;
-    END $$;
-  `);
-
-  // Seed the default league + 5 team slots if not already present.
+  // SEED the default league FIRST so existing-row backfill below has a valid
+  // FK target (league 1) when we add the NOT NULL DEFAULT 1 column to picks.
   await pool.query(`
     INSERT INTO leagues (id, name, invite_code, format, scope)
     VALUES (1, 'Experts PGA Fantasy', 'EXPERTS', 'season_money', 'season')
@@ -203,6 +174,38 @@ async function initSchema() {
       [1, teamId, teamName, color]
     );
   }
+
+  // Now add the league_id columns. Existing rows backfill to 1, which is a
+  // valid FK target now that league 1 exists.
+  await pool.query(`
+    ALTER TABLE picks
+      ADD COLUMN IF NOT EXISTS league_id BIGINT NOT NULL DEFAULT 1
+        REFERENCES leagues(id) ON DELETE CASCADE;
+    ALTER TABLE chat_messages
+      ADD COLUMN IF NOT EXISTS league_id BIGINT NOT NULL DEFAULT 1
+        REFERENCES leagues(id) ON DELETE CASCADE;
+  `);
+
+  // Replace picks PRIMARY KEY to include league_id (only if not already done).
+  await pool.query(`
+    DO $$
+    BEGIN
+      IF EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+         WHERE table_name='picks'
+           AND constraint_type='PRIMARY KEY'
+           AND constraint_name='picks_pkey'
+      ) AND NOT EXISTS (
+        SELECT 1 FROM information_schema.key_column_usage
+         WHERE table_name='picks'
+           AND constraint_name='picks_pkey'
+           AND column_name='league_id'
+      ) THEN
+        ALTER TABLE picks DROP CONSTRAINT picks_pkey;
+        ALTER TABLE picks ADD PRIMARY KEY (league_id, team_id, major_id);
+      END IF;
+    END $$;
+  `);
 
   console.log("✓  Postgres schema ready · default league seeded");
 }
