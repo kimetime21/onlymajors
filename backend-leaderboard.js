@@ -329,6 +329,16 @@ function requireAuth(req, res, next) {
   next();
 }
 
+// Resolve the team_id the authenticated user owns in the given league.
+async function getUserTeamId(userId, leagueId = DEFAULT_LEAGUE_ID) {
+  if (!pool) return null;
+  const { rows } = await pool.query(
+    `SELECT team_id FROM league_members WHERE user_id = $1 AND league_id = $2`,
+    [userId, leagueId]
+  );
+  return rows[0]?.team_id || null;
+}
+
 // ─────────────────────────────────────────────────────────────
 // Major ID → DataGolf event_id mapping
 // ─────────────────────────────────────────────────────────────
@@ -849,12 +859,14 @@ function requireDb(res) {
 // GET /api/picks/:teamId               → all majors for one team
 // PUT /api/picks/:teamId/:majorId      → set/replace one slot
 //   body: { starters: [], bench: [], subs: [], submitted: bool }
-app.get("/api/picks", async (req, res) => {
+app.get("/api/picks", requireAuth, async (req, res) => {
   if (!requireDb(res)) return;
   try {
-    const { rows } = await pool.query(`SELECT * FROM picks`);
-    // Reshape into nested form the frontend expects:
-    //   { [teamId]: { [majorId]: { starters, bench, subs, submitted } } }
+    const { rows } = await pool.query(
+      `SELECT team_id, major_id, starters, bench, subs, submitted
+         FROM picks WHERE league_id = $1`,
+      [DEFAULT_LEAGUE_ID]
+    );
     const out = {};
     for (const r of rows) {
       out[r.team_id] = out[r.team_id] || {};
@@ -871,21 +883,26 @@ app.get("/api/picks", async (req, res) => {
   }
 });
 
-app.put("/api/picks/:teamId/:majorId", async (req, res) => {
+app.put("/api/picks/:teamId/:majorId", requireAuth, async (req, res) => {
   if (!requireDb(res)) return;
   const { teamId, majorId } = req.params;
   const { starters = [], bench = [], subs = [], submitted = false } = req.body || {};
   try {
+    // Ownership check — the authenticated user must own teamId in the league.
+    const ownerTeam = await getUserTeamId(req.user.id);
+    if (ownerTeam !== teamId) {
+      return res.status(403).json({ error: "you can only edit your own team's picks" });
+    }
     await pool.query(
-      `INSERT INTO picks (team_id, major_id, starters, bench, subs, submitted, updated_at)
-       VALUES ($1, $2, $3::jsonb, $4::jsonb, $5::jsonb, $6, NOW())
-       ON CONFLICT (team_id, major_id)
+      `INSERT INTO picks (league_id, team_id, major_id, starters, bench, subs, submitted, updated_at)
+       VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, NOW())
+       ON CONFLICT (league_id, team_id, major_id)
        DO UPDATE SET starters = EXCLUDED.starters,
                      bench    = EXCLUDED.bench,
                      subs     = EXCLUDED.subs,
                      submitted = EXCLUDED.submitted,
                      updated_at = NOW()`,
-      [teamId, majorId, JSON.stringify(starters), JSON.stringify(bench), JSON.stringify(subs), submitted]
+      [DEFAULT_LEAGUE_ID, teamId, majorId, JSON.stringify(starters), JSON.stringify(bench), JSON.stringify(subs), submitted]
     );
     res.json({ ok: true });
   } catch (err) {
@@ -895,14 +912,16 @@ app.put("/api/picks/:teamId/:majorId", async (req, res) => {
 
 // GET  /api/chat                       → last 200 messages, oldest first
 // POST /api/chat                       → { teamId, text } → inserts row
-app.get("/api/chat", async (req, res) => {
+app.get("/api/chat", requireAuth, async (req, res) => {
   if (!requireDb(res)) return;
   try {
     const { rows } = await pool.query(
       `SELECT id, team_id AS "teamId", text, ts
          FROM chat_messages
+        WHERE league_id = $1
         ORDER BY ts DESC
-        LIMIT 200`
+        LIMIT 200`,
+      [DEFAULT_LEAGUE_ID]
     );
     res.json(rows.reverse());   // oldest first for UI
   } catch (err) {
@@ -910,16 +929,19 @@ app.get("/api/chat", async (req, res) => {
   }
 });
 
-app.post("/api/chat", async (req, res) => {
+app.post("/api/chat", requireAuth, async (req, res) => {
   if (!requireDb(res)) return;
-  const { teamId, text } = req.body || {};
-  if (!teamId || !text || !text.trim()) return res.status(400).json({ error: "teamId and text required" });
+  const { text } = req.body || {};
+  if (!text || !text.trim()) return res.status(400).json({ error: "text required" });
   try {
+    // Force teamId from the authenticated user's claim — ignore the client-sent value.
+    const teamId = await getUserTeamId(req.user.id);
+    if (!teamId) return res.status(403).json({ error: "you must claim a team to chat" });
     const ts = Date.now();
     const { rows } = await pool.query(
-      `INSERT INTO chat_messages (team_id, text, ts) VALUES ($1, $2, $3)
+      `INSERT INTO chat_messages (league_id, team_id, text, ts) VALUES ($1, $2, $3, $4)
        RETURNING id, team_id AS "teamId", text, ts`,
-      [teamId, text.trim().slice(0, 1000), ts]
+      [DEFAULT_LEAGUE_ID, teamId, text.trim().slice(0, 1000), ts]
     );
     res.json(rows[0]);
   } catch (err) {
@@ -947,11 +969,16 @@ app.get("/api/profiles", async (req, res) => {
   }
 });
 
-app.put("/api/profiles/:teamId", async (req, res) => {
+app.put("/api/profiles/:teamId", requireAuth, async (req, res) => {
   if (!requireDb(res)) return;
   const { teamId } = req.params;
   const { displayName = null, teamName = null, email = null } = req.body || {};
   try {
+    // Ownership: only your own team's profile.
+    const ownerTeam = await getUserTeamId(req.user.id);
+    if (ownerTeam !== teamId) {
+      return res.status(403).json({ error: "you can only edit your own profile" });
+    }
     await pool.query(
       `INSERT INTO profiles (team_id, display_name, team_name, email, updated_at)
        VALUES ($1, $2, $3, $4, NOW())
