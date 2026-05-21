@@ -184,6 +184,8 @@ async function initSchema() {
     ALTER TABLE chat_messages
       ADD COLUMN IF NOT EXISTS league_id BIGINT NOT NULL DEFAULT 1
         REFERENCES leagues(id) ON DELETE CASCADE;
+    ALTER TABLE round_snapshots
+      ADD COLUMN IF NOT EXISTS round_score NUMERIC;
   `);
 
   // Replace picks PRIMARY KEY to include league_id (only if not already done).
@@ -226,6 +228,7 @@ async function loadSnapshotsFromDB() {
         projMoney:  r.proj_money == null ? null : Number(r.proj_money),
         finalMoney: r.final_money == null ? null : Number(r.final_money),
         score:      r.score == null ? null : Number(r.score),
+        roundScore: r.round_score == null ? null : Number(r.round_score),
         position:   r.position,
         status:     r.status,
         ts:         r.updated_at ? new Date(r.updated_at).getTime() : Date.now(),
@@ -241,16 +244,17 @@ async function persistSnapshot(majorId, dgId, round, snap) {
   if (!pool) return;
   try {
     await pool.query(
-      `INSERT INTO round_snapshots (major_id, dg_id, round, proj_money, final_money, score, position, status, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+      `INSERT INTO round_snapshots (major_id, dg_id, round, proj_money, final_money, score, round_score, position, status, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
        ON CONFLICT (major_id, dg_id, round)
        DO UPDATE SET proj_money = EXCLUDED.proj_money,
                      final_money = EXCLUDED.final_money,
                      score = EXCLUDED.score,
+                     round_score = EXCLUDED.round_score,
                      position = EXCLUDED.position,
                      status = EXCLUDED.status,
                      updated_at = NOW()`,
-      [majorId, dgId, round, snap.projMoney, snap.finalMoney, snap.score, snap.position, snap.status]
+      [majorId, dgId, round, snap.projMoney, snap.finalMoney, snap.score, snap.roundScore ?? null, snap.position, snap.status]
     );
   } catch (e) {
     console.warn(`snapshot persist failed (${majorId}/${dgId}/r${round}):`, e.message);
@@ -347,6 +351,14 @@ const DG_EVENT_IDS = {
   pga:     33,
   usopen:  26,
   open:    100,
+};
+// Par per major (used to recover round-stroke totals from cumulative score
+// in the snapshot store when DataGolf only gave us score-to-par).
+const MAJOR_PAR = {
+  masters: 72,  // Augusta National
+  pga:     70,  // Aronimink (2026)
+  usopen:  70,  // Shinnecock Hills (2026)
+  open:    70,  // Royal Birkdale (2026)
 };
 
 // ─────────────────────────────────────────────────────────────
@@ -516,23 +528,91 @@ function recordRoundSnapshotInPlay(majorId, currentRound, players) {
   SNAPSHOTS[majorId] = SNAPSHOTS[majorId] || {};
   const store = SNAPSHOTS[majorId];
 
+  // Capture ALL completed rounds, not just the current one. DataGolf returns
+  // R1..R4 strokes on each player, so we can backfill any rounds we missed.
   for (const p of players || []) {
     if (!p?.dg_id) continue;
     store[p.dg_id] = store[p.dg_id] || {};
     const pos = typeof p.current_pos === "number" ? `${p.current_pos}` : (p.current_pos || "");
-    const snap = {
+    const isMC = pos === "MC" || pos === "CUT" || p.make_cut === 0;
+
+    // Snapshot the CURRENT round with everything we know now.
+    store[p.dg_id][currentRound] = {
       projMoney:  p.prize_money_projected ?? null,
       finalMoney: p.final_money ?? null,
       score:      typeof p.current_score === "number" ? p.current_score : null,
+      roundScore: p[`R${currentRound}`] ?? p[`r${currentRound}`] ?? null,
       position:   pos,
-      status:     pos === "MC" || pos === "CUT" ? "mc" : "made_cut",
+      status:     isMC ? "mc" : "made_cut",
       ts:         Date.now(),
     };
-    store[p.dg_id][currentRound] = snap;
-    // Write through to Postgres (fire-and-forget). On Railway restart, the
-    // snapshot store is rehydrated from DB so round progression is preserved.
-    persistSnapshot(majorId, p.dg_id, currentRound, snap);
+    persistSnapshot(majorId, p.dg_id, currentRound, store[p.dg_id][currentRound]);
+
+    // Backfill stroke totals for any earlier rounds we don't already have.
+    for (let r = 1; r < currentRound; r++) {
+      const earlierStrokes = p[`R${r}`] ?? p[`r${r}`] ?? null;
+      if (earlierStrokes == null) continue;
+      const prior = store[p.dg_id][r];
+      if (prior && prior.roundScore != null) continue;   // already captured
+      store[p.dg_id][r] = {
+        ...(prior || {}),
+        projMoney:  prior?.projMoney ?? null,
+        finalMoney: prior?.finalMoney ?? null,
+        score:      prior?.score ?? null,
+        roundScore: earlierStrokes,
+        position:   prior?.position ?? "",
+        status:     prior?.status ?? (isMC && r > currentRound ? "mc" : "made_cut"),
+        ts:         Date.now(),
+      };
+      persistSnapshot(majorId, p.dg_id, r, store[p.dg_id][r]);
+    }
   }
+}
+
+// Build a leaderboard response purely from SNAPSHOTS — used when DataGolf's
+// in-play has moved on to a different tournament but we want to serve the
+// final results for a completed major.
+function buildSnapshotLeaderboard(majorId) {
+  const par = MAJOR_PAR[majorId] ?? 72;
+  const snaps = SNAPSHOTS[majorId] || {};
+  const golfers = {};
+  for (const dgIdStr of Object.keys(snaps)) {
+    const dgId = parseInt(dgIdStr, 10);
+    const player = snaps[dgId];
+    if (!player) continue;
+    const latest = player[4] || player[3] || player[2] || player[1];
+    if (!latest) continue;
+
+    const gid = DGID_TO_GID.get(dgId) || `dg-${dgId}`;
+    const name = GID_TO_NAME.get(gid) || null;
+    const moneyAt = (r) => player[r]?.finalMoney ?? player[r]?.projMoney ?? null;
+    // Stroke totals: prefer roundScore (DataGolf's R1..R4), else derive from
+    // cumulative score-to-par + par. Derivation requires prior round's score.
+    const cumulative = (r) => player[r]?.score;
+    const strokesAt = (r) => {
+      if (player[r]?.roundScore != null) return player[r].roundScore;
+      const cur = cumulative(r);
+      const prev = r === 1 ? 0 : cumulative(r-1);
+      if (cur == null || prev == null) return null;
+      return par + (cur - prev);
+    };
+
+    golfers[gid] = {
+      matched:    !gid.startsWith("dg-"),
+      name:       name,
+      country:    "",
+      dg_id:      dgId,
+      position:   latest.position || "",
+      score:      latest.score ?? null,
+      thru:       "",
+      status:     latest.status || "made_cut",
+      projMoney:  player[4]?.projMoney ?? null,
+      finalMoney: player[4]?.finalMoney ?? player[4]?.projMoney ?? null,
+      r1: moneyAt(1), r2: moneyAt(2), r3: moneyAt(3), r4: moneyAt(4),
+      r1Score: strokesAt(1), r2Score: strokesAt(2), r3Score: strokesAt(3), r4Score: strokesAt(4),
+    };
+  }
+  return golfers;
 }
 
 function getPlayerRounds(majorId, dgId) {
@@ -625,9 +705,9 @@ app.get("/api/leaderboard/:majorId", async (req, res) => {
   if (!eventId) return res.status(404).json({ error: `unknown major: ${majorId}` });
 
   try {
-    // /preds/in-play returns: current_pos, current_score, thru,
-    // R1, R2, R3, R4 round scores, prize_money_projected, make_cut probabilities.
-    // This is the right endpoint for "leaderboard with projected money".
+    // Pull DataGolf's current in-play. Whatever tournament is active right now
+    // shows up here — could be this major (during major week) or a totally
+    // different PGA Tour event (the rest of the year).
     const data = await cached(`lb:${majorId}`, CACHE_TTL, () =>
       fetchDG("/preds/in-play", { tour: "pga", dead_heat: "yes", odds_format: "percent" })
     );
@@ -636,49 +716,60 @@ app.get("/api/leaderboard/:majorId", async (req, res) => {
                   : Array.isArray(data) ? data : [];
     const currentRound = data?.current_round || data?.round || null;
 
-    // Hydrate the dg_id ↔ short id reverse maps + record round-money snapshot.
-    recordRoundSnapshotInPlay(majorId, currentRound, players);
+    // Keep name maps warm regardless of which tournament in-play is showing.
+    hydrateNameMaps(players);
 
-    const golfers = {};
-    for (const p of players) {
-      const matchedGid = matchGolferId(p.player_name);
-      const gid = matchedGid || `dg-${p.dg_id || NORMALIZE(p.player_name)}`;
-      const made = p.make_cut !== 0 && p.current_pos !== "MC" && p.current_pos !== "CUT";
-      const pos  = typeof p.current_pos === "number"
-                 ? `${p.current_pos}`
-                 : (p.current_pos || "");
-      const moneyRounds = p.dg_id ? getPlayerRounds(majorId, p.dg_id) : { r1: null, r2: null, r3: null, r4: null };
+    // Detect if DataGolf's current in-play IS this major. Compare its event_id
+    // to our expected one. Be permissive about the field name.
+    const inPlayEventId = data?.event_id ?? data?.eventId ?? data?.event ?? null;
+    const isThisMajorLive = inPlayEventId != null && Number(inPlayEventId) === Number(eventId);
 
-      golfers[gid] = {
-        matched:     !!matchedGid,
-        name:        prettyName(p.player_name || ""),
-        country:     p.country || "",
-        dg_id:       p.dg_id || null,
-        position:    pos,
-        score:       typeof p.current_score === "number" ? p.current_score : null,
-        thru:        p.thru ?? "",
-        status:      made ? "made_cut" : "mc",
-        projMoney:   p.prize_money_projected ?? p.proj_money ?? null,
-        finalMoney:  p.final_money ?? null,
-        // Per-round projected money — money we've snapshotted as the tournament
-        // progressed. r1/r2/r3 only populate if we were online when each round ended.
-        r1: moneyRounds.r1,
-        r2: moneyRounds.r2,
-        r3: moneyRounds.r3,
-        r4: moneyRounds.r4,
-        // Round-by-round STROKE scores from DataGolf — always available
-        // historically. Frontend can use these in the stats panel even when
-        // money snapshots are missing.
-        r1Score: p.R1 ?? p.r1 ?? null,
-        r2Score: p.R2 ?? p.r2 ?? null,
-        r3Score: p.R3 ?? p.r3 ?? null,
-        r4Score: p.R4 ?? p.r4 ?? null,
-      };
+    // Only snapshot when in-play IS this major. Otherwise we'd corrupt this
+    // major's final R4 snapshot with a totally different tournament's data.
+    if (isThisMajorLive) {
+      recordRoundSnapshotInPlay(majorId, currentRound, players);
     }
+
+    let golfers;
+    if (isThisMajorLive) {
+      // LIVE MODE — build from in-play + snapshot money overlay
+      golfers = {};
+      for (const p of players) {
+        const matchedGid = matchGolferId(p.player_name);
+        const gid = matchedGid || `dg-${p.dg_id || NORMALIZE(p.player_name)}`;
+        const pos = typeof p.current_pos === "number" ? `${p.current_pos}` : (p.current_pos || "");
+        const made = p.make_cut !== 0 && pos !== "MC" && pos !== "CUT";
+        const moneyRounds = p.dg_id ? getPlayerRounds(majorId, p.dg_id) : { r1: null, r2: null, r3: null, r4: null };
+
+        golfers[gid] = {
+          matched:    !!matchedGid,
+          name:       prettyName(p.player_name || ""),
+          country:    p.country || "",
+          dg_id:      p.dg_id || null,
+          position:   pos,
+          score:      typeof p.current_score === "number" ? p.current_score : null,
+          thru:       p.thru ?? "",
+          status:     made ? "made_cut" : "mc",
+          projMoney:  p.prize_money_projected ?? p.proj_money ?? null,
+          finalMoney: p.final_money ?? null,
+          r1: moneyRounds.r1, r2: moneyRounds.r2, r3: moneyRounds.r3, r4: moneyRounds.r4,
+          r1Score: p.R1 ?? p.r1 ?? null,
+          r2Score: p.R2 ?? p.r2 ?? null,
+          r3Score: p.R3 ?? p.r3 ?? null,
+          r4Score: p.R4 ?? p.r4 ?? null,
+        };
+      }
+    } else {
+      // HISTORICAL MODE — in-play is a different tournament; serve only from
+      // persisted snapshots so this major's final results stay accurate.
+      golfers = buildSnapshotLeaderboard(majorId);
+    }
+
     res.json({
-      tournamentName: data?.event_name || null,
-      currentRound,
-      lastUpdated:    data?.last_updated || null,
+      tournamentName: isThisMajorLive ? (data?.event_name || null) : null,
+      currentRound:   isThisMajorLive ? currentRound : null,
+      isActive:       isThisMajorLive,
+      lastUpdated:    isThisMajorLive ? (data?.last_updated || null) : null,
       golfers,
     });
   } catch (err) {
