@@ -186,6 +186,8 @@ async function initSchema() {
         REFERENCES leagues(id) ON DELETE CASCADE;
     ALTER TABLE round_snapshots
       ADD COLUMN IF NOT EXISTS round_score NUMERIC;
+    ALTER TABLE picks
+      ADD COLUMN IF NOT EXISTS score_prediction INTEGER;
   `);
 
   // Replace picks PRIMARY KEY to include league_id (only if not already done).
@@ -916,20 +918,86 @@ app.get("/api/backfill/:majorId", async (req, res) => {
   }
 });
 
+// /api/field/:majorId — returns the FULL field for a major from DataGolf,
+// not just players curated in our matcher table. Tries multiple DataGolf
+// sources (in-play if the major is live, /field-updates if DataGolf has the
+// major queued as the next event, snapshots otherwise) and returns rich
+// player rows the frontend can render even if the player isn't in GOLFERS.
 app.get("/api/field/:majorId", async (req, res) => {
   const majorId = req.params.majorId;
   const eventId = DG_EVENT_IDS[majorId];
   if (!eventId) return res.status(404).json({ error: `unknown major: ${majorId}` });
 
   try {
-    const data = await cached(`field:${majorId}`, CACHE_TTL * 5, () =>
-      fetchDG("/field-updates", { tour: "pga" })
-    );
-    const ids = (data?.field || [])
-      .map(p => matchGolferId(p.player_name))
-      .filter(Boolean);
-    res.json({ count: ids.length, golfers: ids, lastUpdated: data?.last_updated || null });
+    let rawPlayers = [];
+    let lastUpdated = null;
+    let eventName = null;
+    let source = "none";
+
+    // Source 1: live in-play (cached) when this major is currently being played
+    const lbCached = cache.get(`lb:${majorId}`)?.data;
+    const lbEventId = lbCached?.event_id ?? lbCached?.eventId ?? null;
+    if (lbCached && lbEventId && Number(lbEventId) === Number(eventId)) {
+      rawPlayers = Array.isArray(lbCached.data) ? lbCached.data : [];
+      lastUpdated = lbCached.last_updated;
+      eventName = lbCached.event_name;
+      source = "in-play";
+    }
+
+    // Source 2: /field-updates — DataGolf's "next tournament" field. Only use
+    // it if its event_id matches this major (otherwise it's a different week's
+    // field). Cache 5x longer than leaderboards since fields move slowly.
+    if (rawPlayers.length === 0) {
+      const fieldData = await cached(`field:${majorId}`, CACHE_TTL * 5, () =>
+        fetchDG("/field-updates", { tour: "pga" }).catch(() => null)
+      );
+      const fieldEventId = fieldData?.event_id ?? fieldData?.eventId ?? null;
+      if (fieldData && fieldEventId && Number(fieldEventId) === Number(eventId)) {
+        rawPlayers = Array.isArray(fieldData.field) ? fieldData.field : [];
+        lastUpdated = fieldData.last_updated;
+        eventName = fieldData.event_name;
+        source = "field-updates";
+      }
+    }
+
+    // Source 3: snapshots from a prior tournament week (for completed majors).
+    if (rawPlayers.length === 0 && SNAPSHOTS[majorId]) {
+      rawPlayers = Object.keys(SNAPSHOTS[majorId]).map(dgIdStr => {
+        const dgId = Number(dgIdStr);
+        const gid  = DGID_TO_GID.get(dgId);
+        return {
+          dg_id: dgId,
+          player_name: GID_TO_NAME.get(gid) || `Player ${dgId}`,
+          country: "",
+        };
+      });
+      source = "snapshots";
+    }
+
+    // Hydrate name maps + build rich response.
+    hydrateNameMaps(rawPlayers);
+
+    const players = rawPlayers.map(p => {
+      const matchedGid = matchGolferId(p.player_name);
+      const gid = matchedGid || `dg-${p.dg_id || NORMALIZE(p.player_name)}`;
+      return {
+        gid,
+        name:    prettyName(p.player_name || ""),
+        country: p.country || "",
+        dg_id:   p.dg_id || null,
+        matched: !!matchedGid,
+      };
+    });
+
+    res.json({
+      count: players.length,
+      source,
+      eventName,
+      lastUpdated,
+      players,
+    });
   } catch (err) {
+    console.error(`field ${majorId}:`, err.message);
     res.status(502).json({ error: err.message });
   }
 });
@@ -954,7 +1022,7 @@ app.get("/api/picks", requireAuth, async (req, res) => {
   if (!requireDb(res)) return;
   try {
     const { rows } = await pool.query(
-      `SELECT team_id, major_id, starters, bench, subs, submitted
+      `SELECT team_id, major_id, starters, bench, subs, submitted, score_prediction
          FROM picks WHERE league_id = $1`,
       [DEFAULT_LEAGUE_ID]
     );
@@ -962,10 +1030,11 @@ app.get("/api/picks", requireAuth, async (req, res) => {
     for (const r of rows) {
       out[r.team_id] = out[r.team_id] || {};
       out[r.team_id][r.major_id] = {
-        starters:  r.starters  || [],
-        bench:     r.bench     || [],
-        subs:      r.subs      || [],
-        submitted: r.submitted,
+        starters:        r.starters  || [],
+        bench:           r.bench     || [],
+        subs:            r.subs      || [],
+        submitted:       r.submitted,
+        scorePrediction: r.score_prediction == null ? null : Number(r.score_prediction),
       };
     }
     res.json(out);
@@ -977,23 +1046,25 @@ app.get("/api/picks", requireAuth, async (req, res) => {
 app.put("/api/picks/:teamId/:majorId", requireAuth, async (req, res) => {
   if (!requireDb(res)) return;
   const { teamId, majorId } = req.params;
-  const { starters = [], bench = [], subs = [], submitted = false } = req.body || {};
+  const { starters = [], bench = [], subs = [], submitted = false, scorePrediction = null } = req.body || {};
   try {
     // Ownership check — the authenticated user must own teamId in the league.
     const ownerTeam = await getUserTeamId(req.user.id);
     if (ownerTeam !== teamId) {
       return res.status(403).json({ error: "you can only edit your own team's picks" });
     }
+    const sp = scorePrediction == null ? null : Math.max(-20, Math.min(10, Math.round(Number(scorePrediction))));
     await pool.query(
-      `INSERT INTO picks (league_id, team_id, major_id, starters, bench, subs, submitted, updated_at)
-       VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, NOW())
+      `INSERT INTO picks (league_id, team_id, major_id, starters, bench, subs, submitted, score_prediction, updated_at)
+       VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, $8, NOW())
        ON CONFLICT (league_id, team_id, major_id)
        DO UPDATE SET starters = EXCLUDED.starters,
                      bench    = EXCLUDED.bench,
                      subs     = EXCLUDED.subs,
                      submitted = EXCLUDED.submitted,
+                     score_prediction = EXCLUDED.score_prediction,
                      updated_at = NOW()`,
-      [DEFAULT_LEAGUE_ID, teamId, majorId, JSON.stringify(starters), JSON.stringify(bench), JSON.stringify(subs), submitted]
+      [DEFAULT_LEAGUE_ID, teamId, majorId, JSON.stringify(starters), JSON.stringify(bench), JSON.stringify(subs), submitted, sp]
     );
     res.json({ ok: true });
   } catch (err) {
