@@ -345,6 +345,28 @@ async function getUserTeamId(userId, leagueId = DEFAULT_LEAGUE_ID) {
   return rows[0]?.team_id || null;
 }
 
+// Pick the right leagueId for a request. Order of resolution:
+//   1. explicit ?leagueId=X (or body.leagueId)  — must be one the user belongs to
+//   2. user's earliest-joined league             — covers single-league users
+//   3. DEFAULT_LEAGUE_ID                          — last-resort fallback
+// Returns null if the user has no league memberships at all.
+async function resolveLeagueId(userId, requested) {
+  if (!pool) return DEFAULT_LEAGUE_ID;
+  // List the user's leagues once so we can both validate explicit picks and
+  // fall back to "first joined" cleanly.
+  const { rows } = await pool.query(
+    `SELECT league_id FROM league_members WHERE user_id = $1 ORDER BY joined_at ASC`,
+    [userId]
+  );
+  const memberLeagues = rows.map(r => Number(r.league_id));
+  if (requested != null && requested !== "") {
+    const id = Number(requested);
+    if (Number.isFinite(id) && memberLeagues.includes(id)) return id;
+    return null;   // caller will 403/404
+  }
+  return memberLeagues[0] ?? DEFAULT_LEAGUE_ID;
+}
+
 // ─────────────────────────────────────────────────────────────
 // Major ID → DataGolf event_id mapping
 // ─────────────────────────────────────────────────────────────
@@ -1021,10 +1043,12 @@ function requireDb(res) {
 app.get("/api/picks", requireAuth, async (req, res) => {
   if (!requireDb(res)) return;
   try {
+    const leagueId = await resolveLeagueId(req.user.id, req.query.leagueId);
+    if (leagueId == null) return res.status(403).json({ error: "not a member of that league" });
     const { rows } = await pool.query(
       `SELECT team_id, major_id, starters, bench, subs, submitted, score_prediction
          FROM picks WHERE league_id = $1`,
-      [DEFAULT_LEAGUE_ID]
+      [leagueId]
     );
     const out = {};
     for (const r of rows) {
@@ -1046,10 +1070,12 @@ app.get("/api/picks", requireAuth, async (req, res) => {
 app.put("/api/picks/:teamId/:majorId", requireAuth, async (req, res) => {
   if (!requireDb(res)) return;
   const { teamId, majorId } = req.params;
-  const { starters = [], bench = [], subs = [], submitted = false, scorePrediction = null } = req.body || {};
+  const { starters = [], bench = [], subs = [], submitted = false, scorePrediction = null, leagueId: bodyLeagueId } = req.body || {};
   try {
-    // Ownership check — the authenticated user must own teamId in the league.
-    const ownerTeam = await getUserTeamId(req.user.id);
+    const leagueId = await resolveLeagueId(req.user.id, req.query.leagueId ?? bodyLeagueId);
+    if (leagueId == null) return res.status(403).json({ error: "not a member of that league" });
+    // Ownership check — the authenticated user must own teamId in this league.
+    const ownerTeam = await getUserTeamId(req.user.id, leagueId);
     if (ownerTeam !== teamId) {
       return res.status(403).json({ error: "you can only edit your own team's picks" });
     }
@@ -1064,7 +1090,7 @@ app.put("/api/picks/:teamId/:majorId", requireAuth, async (req, res) => {
                      submitted = EXCLUDED.submitted,
                      score_prediction = EXCLUDED.score_prediction,
                      updated_at = NOW()`,
-      [DEFAULT_LEAGUE_ID, teamId, majorId, JSON.stringify(starters), JSON.stringify(bench), JSON.stringify(subs), submitted, sp]
+      [leagueId, teamId, majorId, JSON.stringify(starters), JSON.stringify(bench), JSON.stringify(subs), submitted, sp]
     );
     res.json({ ok: true });
   } catch (err) {
@@ -1077,13 +1103,15 @@ app.put("/api/picks/:teamId/:majorId", requireAuth, async (req, res) => {
 app.get("/api/chat", requireAuth, async (req, res) => {
   if (!requireDb(res)) return;
   try {
+    const leagueId = await resolveLeagueId(req.user.id, req.query.leagueId);
+    if (leagueId == null) return res.status(403).json({ error: "not a member of that league" });
     const { rows } = await pool.query(
       `SELECT id, team_id AS "teamId", text, ts
          FROM chat_messages
         WHERE league_id = $1
         ORDER BY ts DESC
         LIMIT 200`,
-      [DEFAULT_LEAGUE_ID]
+      [leagueId]
     );
     res.json(rows.reverse());   // oldest first for UI
   } catch (err) {
@@ -1093,17 +1121,19 @@ app.get("/api/chat", requireAuth, async (req, res) => {
 
 app.post("/api/chat", requireAuth, async (req, res) => {
   if (!requireDb(res)) return;
-  const { text } = req.body || {};
+  const { text, leagueId: bodyLeagueId } = req.body || {};
   if (!text || !text.trim()) return res.status(400).json({ error: "text required" });
   try {
-    // Force teamId from the authenticated user's claim — ignore the client-sent value.
-    const teamId = await getUserTeamId(req.user.id);
+    const leagueId = await resolveLeagueId(req.user.id, req.query.leagueId ?? bodyLeagueId);
+    if (leagueId == null) return res.status(403).json({ error: "not a member of that league" });
+    // Force teamId from the authenticated user's claim in this league.
+    const teamId = await getUserTeamId(req.user.id, leagueId);
     if (!teamId) return res.status(403).json({ error: "you must claim a team to chat" });
     const ts = Date.now();
     const { rows } = await pool.query(
       `INSERT INTO chat_messages (league_id, team_id, text, ts) VALUES ($1, $2, $3, $4)
        RETURNING id, team_id AS "teamId", text, ts`,
-      [DEFAULT_LEAGUE_ID, teamId, text.trim().slice(0, 1000), ts]
+      [leagueId, teamId, text.trim().slice(0, 1000), ts]
     );
     res.json(rows[0]);
   } catch (err) {
@@ -1136,9 +1166,12 @@ app.put("/api/profiles/:teamId", requireAuth, async (req, res) => {
   const { teamId } = req.params;
   const { displayName = null, teamName = null, email = null } = req.body || {};
   try {
-    // Ownership: only your own team's profile.
-    const ownerTeam = await getUserTeamId(req.user.id);
-    if (ownerTeam !== teamId) {
+    // Ownership: the user must own this team_id in ANY of their leagues.
+    const ownership = await pool.query(
+      `SELECT 1 FROM league_members WHERE user_id = $1 AND team_id = $2 LIMIT 1`,
+      [req.user.id, teamId]
+    );
+    if (!ownership.rows.length) {
       return res.status(403).json({ error: "you can only edit your own profile" });
     }
     await pool.query(
@@ -1344,6 +1377,253 @@ app.get("/api/leagues/:leagueId/members", async (req, res) => {
   }
 });
 
+// GET /api/leagues/by-code/:code — look up a league by invite code, return
+// league info + team slots. Used by the signup form so users can type a code
+// and immediately see what teams are still up for grabs.
+app.get("/api/leagues/by-code/:code", async (req, res) => {
+  if (!requireDb(res)) return;
+  const code = String(req.params.code || "").trim().toUpperCase();
+  if (!code) return res.status(400).json({ error: "code required" });
+  try {
+    const lr = await pool.query(
+      `SELECT id, name, invite_code, format, scope, major_id
+         FROM leagues WHERE invite_code = $1`,
+      [code]
+    );
+    if (!lr.rows.length) return res.status(404).json({ error: "league not found" });
+    const league = lr.rows[0];
+    const mr = await pool.query(
+      `SELECT lm.team_id, lm.team_name, lm.team_color, lm.user_id,
+              u.display_name, u.email
+         FROM league_members lm
+         LEFT JOIN users u ON u.id = lm.user_id
+        WHERE lm.league_id = $1
+        ORDER BY lm.joined_at ASC`,
+      [league.id]
+    );
+    res.json({
+      league: {
+        id:         Number(league.id),
+        name:       league.name,
+        code:       league.invite_code,
+        format:     league.format,
+        scope:      league.scope,
+        majorId:    league.major_id,
+      },
+      members: mr.rows.map(r => ({
+        teamId:       r.team_id,
+        teamName:     r.team_name,
+        teamColor:    r.team_color,
+        claimed:      r.user_id != null,
+        displayName:  r.display_name,
+        email:        r.email,
+      })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/leagues — create a new league with auto-provisioned team slots.
+//   body: { name, code?, teamCount? }
+//   - name: human-readable league name (required, max 80 chars)
+//   - code: invite code testers will type to join. If omitted, a random
+//     6-character code is generated. Must be unique, uppercased.
+//   - teamCount: how many team slots to create (default 5, min 2, max 12)
+//   Returns { league, members } in the same shape as /api/leagues/by-code.
+const LEAGUE_COLORS = [
+  "#3A5F8A", "#8A3A3A", "#3A8A5A", "#8A6A3A", "#5A3A8A",
+  "#3A8A8A", "#8A3A6A", "#6A8A3A", "#8A5A3A", "#3A6A8A",
+  "#6A3A8A", "#8A8A3A",
+];
+function randomLeagueCode() {
+  // Avoid ambiguous chars (0/O, 1/I) so codes are easy to read aloud / type.
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let out = "";
+  for (let i = 0; i < 6; i++) {
+    out += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return out;
+}
+app.post("/api/leagues", async (req, res) => {
+  if (!requireDb(res)) return;
+  const rawName = String(req.body?.name || "").trim();
+  if (!rawName) return res.status(400).json({ error: "league name required" });
+  if (rawName.length > 80) return res.status(400).json({ error: "league name too long (max 80)" });
+  const teamCount = Math.min(12, Math.max(2, Number(req.body?.teamCount) || 5));
+  let code = String(req.body?.code || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (code && code.length > 16) return res.status(400).json({ error: "code too long (max 16)" });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // If user didn't supply a code, generate one and retry on collision.
+    if (!code) {
+      for (let attempt = 0; attempt < 8; attempt++) {
+        const candidate = randomLeagueCode();
+        const exists = await client.query(
+          `SELECT 1 FROM leagues WHERE invite_code = $1`,
+          [candidate]
+        );
+        if (!exists.rows.length) { code = candidate; break; }
+      }
+      if (!code) {
+        await client.query("ROLLBACK");
+        return res.status(500).json({ error: "could not generate a unique code, please retry" });
+      }
+    } else {
+      const exists = await client.query(
+        `SELECT 1 FROM leagues WHERE invite_code = $1`,
+        [code]
+      );
+      if (exists.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: `league code "${code}" is taken, try another` });
+      }
+    }
+
+    // Create the league.
+    const lr = await client.query(
+      `INSERT INTO leagues (name, invite_code, format, scope)
+       VALUES ($1, $2, 'season_money', 'season')
+       RETURNING id, name, invite_code, format, scope, major_id`,
+      [rawName, code]
+    );
+    const league = lr.rows[0];
+    const leagueId = Number(league.id);
+
+    // Provision team slots — generic names + a stable color palette.
+    // teamId is namespaced by leagueId so it can't collide with another
+    // league's slot (the profiles table uses team_id as a global key).
+    const members = [];
+    for (let i = 1; i <= teamCount; i++) {
+      const teamId    = `lg${leagueId}t${i}`;
+      const teamName  = `Team ${i}`;
+      const teamColor = LEAGUE_COLORS[(i - 1) % LEAGUE_COLORS.length];
+      await client.query(
+        `INSERT INTO league_members (league_id, team_id, team_name, team_color)
+         VALUES ($1, $2, $3, $4)`,
+        [leagueId, teamId, teamName, teamColor]
+      );
+      members.push({
+        teamId,
+        teamName,
+        teamColor,
+        claimed:     false,
+        displayName: null,
+        email:       null,
+      });
+    }
+
+    await client.query("COMMIT");
+    res.json({
+      league: {
+        id:      leagueId,
+        name:    league.name,
+        code:    league.invite_code,
+        format:  league.format,
+        scope:   league.scope,
+        majorId: league.major_id,
+      },
+      members,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("create league failed:", err.message);
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// GET /api/me/leagues-summary — one round trip with everything the Hub needs
+// to render rich cards for each league the user is in: league info, my team,
+// full members list, and per-team-per-major picks. The frontend uses its
+// existing EARN / MAJORS knowledge to compute season standings, picks status,
+// and live position from this raw data.
+app.get("/api/me/leagues-summary", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const userId = req.user.id;
+    const leagueRows = (await pool.query(
+      `SELECT l.id, l.name, l.invite_code, l.format, l.scope, l.major_id,
+              lm.team_id, lm.team_name, lm.team_color
+         FROM leagues l
+         JOIN league_members lm ON lm.league_id = l.id
+        WHERE lm.user_id = $1
+        ORDER BY lm.joined_at ASC`,
+      [userId]
+    )).rows;
+    if (leagueRows.length === 0) return res.json({ leagues: [] });
+    const leagueIds = leagueRows.map(r => Number(r.id));
+
+    const memberRows = (await pool.query(
+      `SELECT lm.league_id, lm.team_id, lm.team_name, lm.team_color, lm.user_id,
+              u.display_name
+         FROM league_members lm
+         LEFT JOIN users u ON u.id = lm.user_id
+        WHERE lm.league_id = ANY($1::bigint[])
+        ORDER BY lm.joined_at ASC`,
+      [leagueIds]
+    )).rows;
+
+    const pickRows = (await pool.query(
+      `SELECT league_id, team_id, major_id, starters, bench, subs, submitted, score_prediction
+         FROM picks
+        WHERE league_id = ANY($1::bigint[])`,
+      [leagueIds]
+    )).rows;
+
+    const membersByLeague = {};
+    for (const m of memberRows) {
+      const lid = Number(m.league_id);
+      (membersByLeague[lid] = membersByLeague[lid] || []).push({
+        teamId:      m.team_id,
+        teamName:    m.team_name,
+        teamColor:   m.team_color,
+        claimed:     m.user_id != null,
+        displayName: m.display_name,
+      });
+    }
+    const picksByLeague = {};
+    for (const p of pickRows) {
+      const lid = Number(p.league_id);
+      picksByLeague[lid] = picksByLeague[lid] || {};
+      picksByLeague[lid][p.team_id] = picksByLeague[lid][p.team_id] || {};
+      picksByLeague[lid][p.team_id][p.major_id] = {
+        starters:        p.starters || [],
+        bench:           p.bench    || [],
+        subs:            p.subs     || [],
+        submitted:       p.submitted,
+        scorePrediction: p.score_prediction == null ? null : Number(p.score_prediction),
+      };
+    }
+    res.json({
+      leagues: leagueRows.map(r => ({
+        league: {
+          id:      Number(r.id),
+          name:    r.name,
+          code:    r.invite_code,
+          format:  r.format,
+          scope:   r.scope,
+          majorId: r.major_id,
+        },
+        myTeam: {
+          teamId:    r.team_id,
+          teamName:  r.team_name,
+          teamColor: r.team_color,
+        },
+        members: membersByLeague[Number(r.id)] || [],
+        picks:   picksByLeague[Number(r.id)] || {},
+      })),
+    });
+  } catch (err) {
+    console.error("leagues-summary failed:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.listen(PORT, async () => {
   console.log(`✓  OnlyMajors backend listening on :${PORT}`);
   console.log(`   GET    /api/leaderboard/:majorId`);
@@ -1355,6 +1635,8 @@ app.listen(PORT, async () => {
   console.log(`   GET    /api/profiles PUT  /api/profiles/:teamId`);
   console.log(`   POST   /api/auth/signup  /api/auth/login  /api/auth/logout`);
   console.log(`   GET    /api/me  /api/leagues/:id/members`);
+  console.log(`   GET    /api/leagues/by-code/:code   POST /api/leagues`);
+  console.log(`   GET    /api/me/leagues-summary`);
   console.log(`   GET    /api/health`);
   console.log(`   CORS allowed: ${ALLOWED_ORIGINS.join(", ")}`);
   // Wait for the schema to be ready, then rehydrate snapshots from DB.
