@@ -200,7 +200,16 @@ async function initSchema() {
       ADD COLUMN IF NOT EXISTS round_score NUMERIC;
     ALTER TABLE picks
       ADD COLUMN IF NOT EXISTS score_prediction INTEGER;
+    ALTER TABLE leagues
+      ADD COLUMN IF NOT EXISTS member_model TEXT NOT NULL DEFAULT 'open';
+    ALTER TABLE leagues
+      ADD COLUMN IF NOT EXISTS visibility TEXT NOT NULL DEFAULT 'public';
+    ALTER TABLE leagues
+      ADD COLUMN IF NOT EXISTS commissioner_id BIGINT REFERENCES users(id) ON DELETE SET NULL;
   `);
+  // EXPERTS league keeps the legacy pre-allocated 5-slot model. Everything
+  // else defaults to 'open' (no preset slots, members auto-added on join).
+  await pool.query(`UPDATE leagues SET member_model = 'slots' WHERE id = $1`, [1]);
 
   // Replace picks PRIMARY KEY to include league_id (only if not already done).
   await pool.query(`
@@ -327,7 +336,34 @@ async function seedHistoricalArchives() {
   }
 }
 
-initSchema().catch(e => console.error("✖  schema init failed:", e.message));
+// One-time cleanup: delete any orphan leagues that were created under the
+// old code path that didn't set a commissioner AND didn't auto-claim a
+// member. EXPERTS (id=1) is always preserved.
+async function cleanupOrphanLeagues() {
+  if (!pool) return;
+  try {
+    const r = await pool.query(`
+      DELETE FROM leagues
+       WHERE commissioner_id IS NULL
+         AND id != 1
+         AND NOT EXISTS (
+           SELECT 1 FROM league_members
+            WHERE league_members.league_id = leagues.id
+              AND user_id IS NOT NULL
+         )
+       RETURNING id, name`);
+    if (r.rowCount > 0) {
+      console.log(`✓  cleaned up ${r.rowCount} orphan league(s): ` +
+        r.rows.map(x => `${x.id}=${x.name}`).join(", "));
+    }
+  } catch (err) {
+    console.warn("⚠  orphan league cleanup failed:", err.message);
+  }
+}
+
+initSchema()
+  .then(() => cleanupOrphanLeagues())
+  .catch(e => console.error("✖  schema init failed:", e.message));
 
 // Helper: load all persisted snapshots into the in-memory SNAPSHOTS map on boot.
 // Keeps the rest of the codebase unchanged — SNAPSHOTS is still the cache,
@@ -456,6 +492,28 @@ async function getUserTeamId(userId, leagueId = DEFAULT_LEAGUE_ID) {
     [userId, leagueId]
   );
   return rows[0]?.team_id || null;
+}
+
+// Extract the user from a request's auth header if a valid token is present,
+// otherwise null. Doesn't error like requireAuth — useful for endpoints that
+// behave slightly differently for signed-in vs anonymous callers (e.g. league
+// creation auto-claims slot 1 for the creator when authed).
+async function getOptionalUser(req) {
+  if (!pool) return null;
+  const auth = req.headers.authorization || "";
+  if (!auth.startsWith("Bearer ")) return null;
+  const token = auth.slice(7).trim();
+  if (!token) return null;
+  try {
+    const { rows } = await pool.query(
+      `SELECT u.id, u.email, u.display_name AS "displayName"
+         FROM sessions s
+         JOIN users u ON u.id = s.user_id
+        WHERE s.token = $1 AND s.expires_at > NOW()`,
+      [token]
+    );
+    return rows[0] || null;
+  } catch { return null; }
 }
 
 // Pick the right leagueId for a request. Order of resolution:
@@ -1352,7 +1410,7 @@ app.post("/api/auth/signup", async (req, res) => {
   if (!isValidEmail(email))            return res.status(400).json({ error: "invalid email" });
   if (!password || password.length < 6) return res.status(400).json({ error: "password must be at least 6 characters" });
   if (!displayName || !displayName.trim()) return res.status(400).json({ error: "displayName required" });
-  if (!teamId)                          return res.status(400).json({ error: "teamId required" });
+
 
   const normalizedEmail = email.trim().toLowerCase();
   const client = await pool.connect();
@@ -1364,25 +1422,42 @@ app.post("/api/auth/signup", async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(409).json({ error: "email already registered" });
     }
-    // Resolve league.
-    const lr = await client.query(`SELECT id FROM leagues WHERE invite_code = $1`, [leagueCode]);
+    // Resolve league + member_model.
+    const lr = await client.query(
+      `SELECT id, member_model FROM leagues WHERE invite_code = $1`, [leagueCode]
+    );
     if (!lr.rows.length) {
       await client.query("ROLLBACK");
       return res.status(404).json({ error: `unknown league code: ${leagueCode}` });
     }
-    const leagueId = Number(lr.rows[0].id);
-    // Check team slot is unclaimed.
-    const slot = await client.query(
-      `SELECT id, user_id FROM league_members WHERE league_id = $1 AND team_id = $2`,
-      [leagueId, teamId]
-    );
-    if (!slot.rows.length) {
+    const leagueId    = Number(lr.rows[0].id);
+    const memberModel = lr.rows[0].member_model || "open";
+    const visibility  = (await client.query(
+      `SELECT visibility FROM leagues WHERE id = $1`, [leagueId]
+    )).rows[0]?.visibility || "public";
+    if (visibility === "private" && memberModel !== "slots") {
       await client.query("ROLLBACK");
-      return res.status(404).json({ error: `team ${teamId} not in league ${leagueCode}` });
+      return res.status(403).json({ error: "this league is private — ask the commissioner to add you" });
     }
-    if (slot.rows[0].user_id) {
-      await client.query("ROLLBACK");
-      return res.status(409).json({ error: `team ${teamId} already claimed` });
+    let slotRow = null;
+    if (memberModel === "slots") {
+      if (!teamId) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "this league requires picking a team" });
+      }
+      const slot = await client.query(
+        `SELECT id, user_id FROM league_members WHERE league_id = $1 AND team_id = $2`,
+        [leagueId, teamId]
+      );
+      if (!slot.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: `team ${teamId} not in league ${leagueCode}` });
+      }
+      if (slot.rows[0].user_id) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: `team ${teamId} already claimed` });
+      }
+      slotRow = slot.rows[0];
     }
     // Create user.
     const u = await client.query(
@@ -1391,11 +1466,33 @@ app.post("/api/auth/signup", async (req, res) => {
       [normalizedEmail, hashPassword(password), displayName.trim()]
     );
     const userId = Number(u.rows[0].id);
-    // Claim the team slot.
-    await client.query(
-      `UPDATE league_members SET user_id = $1 WHERE id = $2`,
-      [userId, slot.rows[0].id]
-    );
+    if (memberModel === "slots" && slotRow) {
+      // Legacy slot claim.
+      await client.query(
+        `UPDATE league_members SET user_id = $1 WHERE id = $2`,
+        [userId, slotRow.id]
+      );
+    } else {
+      // Open model — add a new member row with displayName as team name.
+      const count = Number((await client.query(
+        `SELECT COUNT(*)::int AS n FROM league_members WHERE league_id = $1`,
+        [leagueId]
+      )).rows[0].n);
+      const newTeamId   = `lg${leagueId}-u${userId}`;
+      const newColor    = LEAGUE_COLORS[count % LEAGUE_COLORS.length];
+      await client.query(
+        `INSERT INTO league_members (league_id, team_id, team_name, team_color, user_id)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [leagueId, newTeamId, displayName.trim(), newColor, userId]
+      );
+    }
+    if (leagueId) {
+      await client.query(
+        `UPDATE leagues SET commissioner_id = $1
+          WHERE id = $2 AND commissioner_id IS NULL`,
+        [userId, leagueId]
+      );
+    }
     // Create session.
     const token = newSessionToken();
     const expires = new Date(Date.now() + SESSION_TTL_DAYS * 24 * 60 * 60 * 1000);
@@ -1522,6 +1619,7 @@ app.get("/api/leagues/by-code/:code", async (req, res) => {
         format:     league.format,
         scope:      league.scope,
         majorId:    league.major_id,
+        memberModel: league.member_model || "open",
       },
       members: mr.rows.map(r => ({
         teamId:       r.team_id,
@@ -1563,7 +1661,6 @@ app.post("/api/leagues", async (req, res) => {
   const rawName = String(req.body?.name || "").trim();
   if (!rawName) return res.status(400).json({ error: "league name required" });
   if (rawName.length > 80) return res.status(400).json({ error: "league name too long (max 80)" });
-  const teamCount = Math.min(12, Math.max(2, Number(req.body?.teamCount) || 5));
   let code = String(req.body?.code || "").trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
   if (code && code.length > 16) return res.status(400).json({ error: "code too long (max 16)" });
 
@@ -1596,48 +1693,51 @@ app.post("/api/leagues", async (req, res) => {
       }
     }
 
-    // Create the league.
+    // Visibility from body (public default); commissioner = authed creator.
+    const visibility = (String(req.body?.visibility || "public").toLowerCase() === "private") ? "private" : "public";
+    const creatorEarly = await getOptionalUser(req);
     const lr = await client.query(
-      `INSERT INTO leagues (name, invite_code, format, scope)
-       VALUES ($1, $2, 'season_money', 'season')
-       RETURNING id, name, invite_code, format, scope, major_id`,
-      [rawName, code]
+      `INSERT INTO leagues (name, invite_code, format, scope, visibility, commissioner_id)
+       VALUES ($1, $2, 'season_money', 'season', $3, $4)
+       RETURNING id, name, invite_code, format, scope, major_id, visibility, commissioner_id, member_model`,
+      [rawName, code, visibility, creatorEarly?.id || null]
     );
     const league = lr.rows[0];
     const leagueId = Number(league.id);
 
-    // Provision team slots — generic names + a stable color palette.
-    // teamId is namespaced by leagueId so it can't collide with another
-    // league's slot (the profiles table uses team_id as a global key).
+    // Open-membership model: no pre-created team slots. If authed, the
+    // creator is added as the first member with their displayName as team.
+    const creator = creatorEarly;
     const members = [];
-    for (let i = 1; i <= teamCount; i++) {
-      const teamId    = `lg${leagueId}t${i}`;
-      const teamName  = `Team ${i}`;
-      const teamColor = LEAGUE_COLORS[(i - 1) % LEAGUE_COLORS.length];
+    if (creator) {
+      const teamId    = `lg${leagueId}-u${creator.id}`;
+      const teamName  = creator.displayName || "Commissioner";
+      const teamColor = LEAGUE_COLORS[0];
       await client.query(
-        `INSERT INTO league_members (league_id, team_id, team_name, team_color)
-         VALUES ($1, $2, $3, $4)`,
-        [leagueId, teamId, teamName, teamColor]
+        `INSERT INTO league_members (league_id, team_id, team_name, team_color, user_id)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [leagueId, teamId, teamName, teamColor, creator.id]
       );
       members.push({
-        teamId,
-        teamName,
-        teamColor,
-        claimed:     false,
-        displayName: null,
-        email:       null,
+        teamId, teamName, teamColor,
+        claimed:     true,
+        displayName: creator.displayName,
+        email:       creator.email,
       });
     }
 
     await client.query("COMMIT");
     res.json({
       league: {
-        id:      leagueId,
-        name:    league.name,
-        code:    league.invite_code,
-        format:  league.format,
-        scope:   league.scope,
-        majorId: league.major_id,
+        id:             leagueId,
+        name:           league.name,
+        code:           league.invite_code,
+        format:         league.format,
+        scope:          league.scope,
+        majorId:        league.major_id,
+        visibility:     league.visibility,
+        commissionerId: league.commissioner_id == null ? null : Number(league.commissioner_id),
+        memberModel:    league.member_model || "open",
       },
       members,
     });
@@ -1648,6 +1748,244 @@ app.post("/api/leagues", async (req, res) => {
   } finally {
     client.release();
   }
+});
+
+// POST /api/leagues/:leagueId/join — authed user joins a league. For 'slots'
+// leagues (EXPERTS) they pass a teamId to claim a specific unclaimed slot.
+// For 'open' leagues they just call it with no body — a member row is auto-
+// created with their displayName as the team name.
+app.post("/api/leagues/:leagueId/join", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  const leagueId = Number(req.params.leagueId);
+  const { teamId } = req.body || {};
+  if (!Number.isFinite(leagueId)) return res.status(400).json({ error: "invalid leagueId" });
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const lr = await client.query(
+      `SELECT id, member_model FROM leagues WHERE id = $1`, [leagueId]
+    );
+    if (!lr.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ error: "league not found" });
+    }
+    const model      = lr.rows[0].member_model || "open";
+    const visibility = (await client.query(
+      `SELECT visibility FROM leagues WHERE id = $1`, [leagueId]
+    )).rows[0]?.visibility || "public";
+    if (visibility === "private") {
+      await client.query("ROLLBACK");
+      return res.status(403).json({ error: "this league is private — ask the commissioner to add you" });
+    }
+
+    // Already a member? Friendly 409.
+    const existing = await client.query(
+      `SELECT 1 FROM league_members WHERE league_id = $1 AND user_id = $2`,
+      [leagueId, req.user.id]
+    );
+    if (existing.rows.length) {
+      await client.query("ROLLBACK");
+      return res.status(409).json({ error: "you're already in this league" });
+    }
+
+    if (model === "slots") {
+      // Legacy EXPERTS path — must pass teamId, claim an unclaimed slot.
+      if (!teamId) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "this league requires picking a team — teamId is required" });
+      }
+      const slot = await client.query(
+        `SELECT id, user_id FROM league_members WHERE league_id = $1 AND team_id = $2`,
+        [leagueId, teamId]
+      );
+      if (!slot.rows.length) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "team slot not in this league" });
+      }
+      if (slot.rows[0].user_id) {
+        await client.query("ROLLBACK");
+        return res.status(409).json({ error: "that team is already claimed" });
+      }
+      await client.query(
+        `UPDATE league_members SET user_id = $1 WHERE id = $2`,
+        [req.user.id, slot.rows[0].id]
+      );
+      await client.query(
+        `UPDATE leagues SET commissioner_id = $1
+          WHERE id = $2 AND commissioner_id IS NULL`,
+        [req.user.id, leagueId]
+      );
+      await client.query("COMMIT");
+      const payload = await meAndLeagues(req.user.id);
+      return res.json({ ok: true, leagueId, teamId, ...payload });
+    }
+
+    // Open model — auto-add a new member row with the user's displayName as
+    // their team name. Color rotates through the palette by member count.
+    const count = Number((await client.query(
+      `SELECT COUNT(*)::int AS n FROM league_members WHERE league_id = $1`,
+      [leagueId]
+    )).rows[0].n);
+    const u = (await client.query(
+      `SELECT display_name AS "displayName" FROM users WHERE id = $1`,
+      [req.user.id]
+    )).rows[0];
+    const newTeamId   = `lg${leagueId}-u${req.user.id}`;
+    const newTeamName = (u?.displayName || "Member").trim();
+    const newColor    = LEAGUE_COLORS[count % LEAGUE_COLORS.length];
+    await client.query(
+      `INSERT INTO league_members (league_id, team_id, team_name, team_color, user_id)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [leagueId, newTeamId, newTeamName, newColor, req.user.id]
+    );
+    // Adopt orphan leagues — if no commissioner is set, the joiner becomes it.
+    await client.query(
+      `UPDATE leagues SET commissioner_id = $1
+        WHERE id = $2 AND commissioner_id IS NULL`,
+      [req.user.id, leagueId]
+    );
+    await client.query("COMMIT");
+    const payload = await meAndLeagues(req.user.id);
+    res.json({ ok: true, leagueId, teamId: newTeamId, ...payload });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// Commissioner-only endpoints. Helper checks that the requesting user is
+// the commissioner of the given league.
+async function requireCommissioner(req, res, leagueId) {
+  const { rows } = await pool.query(
+    `SELECT commissioner_id FROM leagues WHERE id = $1`, [leagueId]
+  );
+  if (!rows.length) { res.status(404).json({ error: "league not found" }); return null; }
+  const commId = rows[0].commissioner_id == null ? null : Number(rows[0].commissioner_id);
+  if (commId !== Number(req.user.id)) {
+    res.status(403).json({ error: "only the commissioner can do that" });
+    return null;
+  }
+  return commId;
+}
+
+// PATCH /api/leagues/:id  — commissioner updates league name / visibility
+app.patch("/api/leagues/:id", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  const leagueId = Number(req.params.id);
+  if (!Number.isFinite(leagueId)) return res.status(400).json({ error: "invalid id" });
+  const ok = await requireCommissioner(req, res, leagueId);
+  if (ok == null) return;
+  const sets = []; const vals = [];
+  if (typeof req.body?.name === "string") {
+    const n = req.body.name.trim();
+    if (!n) return res.status(400).json({ error: "name cannot be empty" });
+    if (n.length > 80) return res.status(400).json({ error: "name too long" });
+    vals.push(n); sets.push(`name = $${vals.length}`);
+  }
+  if (typeof req.body?.visibility === "string") {
+    const v = req.body.visibility === "private" ? "private" : "public";
+    vals.push(v); sets.push(`visibility = $${vals.length}`);
+  }
+  if (!sets.length) return res.json({ ok: true });
+  vals.push(leagueId);
+  await pool.query(`UPDATE leagues SET ${sets.join(", ")} WHERE id = $${vals.length}`, vals);
+  res.json({ ok: true });
+});
+
+// POST /api/leagues/:id/regenerate-code — commissioner gets a fresh code.
+app.post("/api/leagues/:id/regenerate-code", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  const leagueId = Number(req.params.id);
+  if (!Number.isFinite(leagueId)) return res.status(400).json({ error: "invalid id" });
+  const ok = await requireCommissioner(req, res, leagueId);
+  if (ok == null) return;
+  try {
+    let next = null;
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const candidate = randomLeagueCode();
+      const exists = await pool.query(
+        `SELECT 1 FROM leagues WHERE invite_code = $1`, [candidate]
+      );
+      if (!exists.rows.length) { next = candidate; break; }
+    }
+    if (!next) return res.status(500).json({ error: "couldn't generate a unique code" });
+    await pool.query(`UPDATE leagues SET invite_code = $1 WHERE id = $2`, [next, leagueId]);
+    res.json({ ok: true, code: next });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /api/leagues/:id/members/:teamId — commissioner renames a team
+app.patch("/api/leagues/:id/members/:teamId", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  const leagueId = Number(req.params.id);
+  if (!Number.isFinite(leagueId)) return res.status(400).json({ error: "invalid id" });
+  const ok = await requireCommissioner(req, res, leagueId);
+  if (ok == null) return;
+  const name  = typeof req.body?.teamName  === "string" ? req.body.teamName.trim()  : null;
+  const color = typeof req.body?.teamColor === "string" ? req.body.teamColor.trim() : null;
+  const sets = []; const vals = [];
+  if (name)  { if (name.length > 80) return res.status(400).json({ error: "name too long" }); vals.push(name);  sets.push(`team_name = $${vals.length}`); }
+  if (color) { vals.push(color); sets.push(`team_color = $${vals.length}`); }
+  if (!sets.length) return res.json({ ok: true });
+  vals.push(leagueId); vals.push(req.params.teamId);
+  await pool.query(
+    `UPDATE league_members SET ${sets.join(", ")} WHERE league_id = $${vals.length-1} AND team_id = $${vals.length}`,
+    vals
+  );
+  res.json({ ok: true });
+});
+
+// DELETE /api/leagues/:id/members/:teamId — commissioner kicks a member. The
+// row stays (so historical picks/snapshots remain valid) but user_id and
+// scoped picks are cleared so they no longer participate. For 'open' leagues
+// we delete the row outright since there's no preset slot to keep.
+app.delete("/api/leagues/:id/members/:teamId", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  const leagueId = Number(req.params.id);
+  if (!Number.isFinite(leagueId)) return res.status(400).json({ error: "invalid id" });
+  const ok = await requireCommissioner(req, res, leagueId);
+  if (ok == null) return;
+  // Don't let commissioner kick themselves
+  const target = await pool.query(
+    `SELECT lm.user_id, l.member_model FROM league_members lm
+       JOIN leagues l ON l.id = lm.league_id
+      WHERE lm.league_id = $1 AND lm.team_id = $2`,
+    [leagueId, req.params.teamId]
+  );
+  if (!target.rows.length) return res.status(404).json({ error: "member not found" });
+  if (Number(target.rows[0].user_id) === Number(req.user.id)) {
+    return res.status(400).json({ error: "you can't kick yourself" });
+  }
+  if (target.rows[0].member_model === "slots") {
+    // Unclaim the slot but leave the row so a new user can take it
+    await pool.query(
+      `UPDATE league_members SET user_id = NULL WHERE league_id = $1 AND team_id = $2`,
+      [leagueId, req.params.teamId]
+    );
+  } else {
+    await pool.query(
+      `DELETE FROM league_members WHERE league_id = $1 AND team_id = $2`,
+      [leagueId, req.params.teamId]
+    );
+    await pool.query(
+      `DELETE FROM picks WHERE league_id = $1 AND team_id = $2`,
+      [leagueId, req.params.teamId]
+    );
+  }
+  res.json({ ok: true });
+});
+
+// Backward-compat alias — older clients still hit /claim
+// Backward-compat alias — older clients still hit /claim
+app.post("/api/leagues/:leagueId/claim", requireAuth, (req, res, next) => {
+  req.url = `/api/leagues/${req.params.leagueId}/join`;
+  app.handle(req, res, next);
 });
 
 // GET /api/leagues/:leagueId/archive — full season archive for a league
@@ -1707,6 +2045,7 @@ app.get("/api/me/leagues-summary", requireAuth, async (req, res) => {
     const userId = req.user.id;
     const leagueRows = (await pool.query(
       `SELECT l.id, l.name, l.invite_code, l.format, l.scope, l.major_id,
+              l.member_model, l.visibility, l.commissioner_id,
               lm.team_id, lm.team_name, lm.team_color
          FROM leagues l
          JOIN league_members lm ON lm.league_id = l.id
@@ -1761,12 +2100,15 @@ app.get("/api/me/leagues-summary", requireAuth, async (req, res) => {
     res.json({
       leagues: leagueRows.map(r => ({
         league: {
-          id:      Number(r.id),
-          name:    r.name,
-          code:    r.invite_code,
-          format:  r.format,
-          scope:   r.scope,
-          majorId: r.major_id,
+          id:             Number(r.id),
+          name:           r.name,
+          code:           r.invite_code,
+          format:         r.format,
+          scope:          r.scope,
+          majorId:        r.major_id,
+          memberModel:    r.member_model || "open",
+          visibility:     r.visibility   || "public",
+          commissionerId: r.commissioner_id == null ? null : Number(r.commissioner_id),
         },
         myTeam: {
           teamId:    r.team_id,
