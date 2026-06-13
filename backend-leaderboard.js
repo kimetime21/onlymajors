@@ -1900,21 +1900,23 @@ app.post("/api/auth/request-reset", async (req, res) => {
         // the query string regardless of which path it lands on.
         const link = `${FRONTEND_URL}/?reset=${encodeURIComponent(token)}`;
         // Fire the email (best-effort — don't fail the request if email errors).
+        const layoutArgs = {
+          preheader:  "Reset your OnlyMajors password — link expires in 1 hour.",
+          heading:    "Reset your password",
+          intro:      `Someone asked to reset the password for your OnlyMajors account. If that was you, use the button below to set a new one. The link expires in <strong>1 hour</strong>.`,
+          ctaLabel:   "Set a new password",
+          ctaUrl:     link,
+          bodyHtml: `
+            <p style="color:${BRAND.dim};font-size:12px;line-height:1.5;margin:18px 0 4px;">Or paste this URL into your browser:</p>
+            <p style="margin:0 0 4px;word-break:break-all;font-size:12px;line-height:1.4;"><a href="${link}" style="color:${BRAND.green};text-decoration:none;">${link}</a></p>`,
+          footerNote: "If you didn't request this, you can safely ignore it — your password stays the same.",
+        };
         sendEmail({
           to:      email,
           subject: "Reset your OnlyMajors password",
           tag:     "password-reset",
-          html: `
-            <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:560px;margin:0 auto;padding:24px;color:#1a1a1a">
-              <h2 style="color:#2b4535;margin:0 0 12px">Password reset</h2>
-              <p style="margin:0 0 16px;line-height:1.5">Someone asked to reset the password for your OnlyMajors account. If that was you, tap the button below to set a new one. The link expires in <strong>1 hour</strong>.</p>
-              <p style="margin:0 0 24px"><a href="${link}" style="display:inline-block;background:#2b4535;color:#fff;padding:11px 22px;border-radius:8px;text-decoration:none;font-weight:600">Set a new password</a></p>
-              <p style="margin:0 0 8px;color:#666;font-size:13px;line-height:1.5">Or paste this URL into your browser:</p>
-              <p style="margin:0 0 24px;word-break:break-all;font-size:12px;color:#888"><a href="${link}" style="color:#2b4535">${link}</a></p>
-              <p style="margin:0;color:#888;font-size:12px;line-height:1.5">If you didn't request this, you can safely ignore the email — your password stays the same.</p>
-            </div>
-          `,
-          text: `Reset your OnlyMajors password\n\nVisit this link within 1 hour to set a new password:\n${link}\n\nIf you didn't request this, ignore the email.`,
+          html:    emailHtml(layoutArgs),
+          text:    emailText({ ...layoutArgs, bodyText: `Or paste this URL into your browser:\n${link}` }),
         }).catch(e => console.error("[request-reset] email send failed:", e.message));
       }
     }
