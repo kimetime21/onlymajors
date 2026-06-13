@@ -513,6 +513,102 @@ function requireAuth(req, res, next) {
   next();
 }
 
+// ───────── Email layout (shared brand wrapper for ALL notifications) ──────
+// Every notification — test, password reset, picks open, Wednesday reminder,
+// round wrap, MC alert, Saturday reminder — passes its content into these
+// helpers so every email has the same header, footer, button styling, and
+// brand feel. Inline CSS only (Gmail strips <style>), table-based layout
+// (Outlook), max-width 560px, mobile-friendly without media queries.
+const BRAND = {
+  green:     "#2b4535",
+  greenInk:  "#1f3327",
+  cream:     "#f5f1e8",
+  creamSoft: "#faf7ef",
+  ink:       "#1a1a1a",
+  body:      "#4a4a4a",
+  dim:       "#7a7466",
+  faint:     "#b8b2a3",
+  rule:      "#ece8db",
+  white:     "#ffffff",
+};
+
+function emailHtml({ preheader = "", heading, intro, bodyHtml = "", ctaLabel, ctaUrl, footerNote }) {
+  const stack = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif";
+  return `<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="x-apple-disable-message-reformatting" />
+  <meta name="color-scheme" content="light" />
+  <meta name="supported-color-schemes" content="light" />
+  <title>OnlyMajors</title>
+</head>
+<body style="margin:0;padding:0;background:${BRAND.cream};font-family:${stack};color:${BRAND.ink};">
+  <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;mso-hide:all;">${preheader || heading || ""}</div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.cream};">
+    <tr>
+      <td align="center" style="padding:40px 16px;">
+        <table role="presentation" width="560" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.white};border-radius:14px;max-width:560px;width:100%;box-shadow:0 1px 3px rgba(43,69,53,0.06),0 8px 24px rgba(43,69,53,0.06);overflow:hidden;">
+          <tr>
+            <td style="background:${BRAND.creamSoft};padding:28px 32px 22px;text-align:center;border-bottom:1px solid ${BRAND.rule};">
+              <div style="color:${BRAND.green};font-size:22px;font-weight:800;letter-spacing:-0.02em;line-height:1;">OnlyMajors</div>
+              <div style="color:${BRAND.dim};font-size:10px;letter-spacing:0.22em;text-transform:uppercase;margin-top:6px;">Fantasy golf when it counts</div>
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:30px 32px 8px;">
+              <h1 style="color:${BRAND.ink};font-size:22px;font-weight:700;margin:0 0 12px;line-height:1.3;">${heading}</h1>
+              ${intro ? `<p style="color:${BRAND.body};font-size:15px;line-height:1.55;margin:0 0 18px;">${intro}</p>` : ""}
+              ${bodyHtml}
+              ${ctaUrl ? `
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:22px 0 6px;">
+                <tr>
+                  <td style="background:${BRAND.green};border-radius:8px;">
+                    <a href="${ctaUrl}" style="display:inline-block;color:${BRAND.white};font-size:15px;font-weight:600;text-decoration:none;padding:12px 26px;font-family:${stack};">${ctaLabel || "Open OnlyMajors"}</a>
+                  </td>
+                </tr>
+              </table>` : ""}
+            </td>
+          </tr>
+          <tr>
+            <td style="padding:24px 32px 28px;border-top:1px solid ${BRAND.rule};background:${BRAND.creamSoft};">
+              ${footerNote ? `<p style="color:${BRAND.dim};font-size:12px;line-height:1.55;margin:0 0 12px;text-align:center;">${footerNote}</p>` : ""}
+              <p style="color:${BRAND.dim};font-size:11px;line-height:1.5;margin:0;text-align:center;">
+                <a href="https://onlymajors.com/settings#notifications" style="color:${BRAND.green};text-decoration:none;font-weight:600;">Email preferences</a>
+                &nbsp;·&nbsp;
+                <a href="mailto:hello@onlymajors.com" style="color:${BRAND.green};text-decoration:none;font-weight:600;">Get in touch</a>
+              </p>
+              <p style="color:${BRAND.faint};font-size:10px;letter-spacing:0.06em;text-align:center;margin:14px 0 0;">OnlyMajors · onlymajors.com</p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>`;
+}
+
+// Plain-text companion. Required for deliverability — major clients (Gmail
+// included) penalize HTML-only emails. Mirrors structure, omits styling.
+function emailText({ heading, intro, bodyText = "", ctaLabel, ctaUrl, footerNote }) {
+  const lines = [
+    "OnlyMajors — fantasy golf when it counts",
+    "",
+    heading,
+    intro ? "\n" + intro : "",
+    bodyText ? "\n" + bodyText : "",
+    ctaUrl ? `\n${ctaLabel || "Open OnlyMajors"}: ${ctaUrl}` : "",
+    "",
+    "—",
+    footerNote || "",
+    "Email preferences: https://onlymajors.com/settings#notifications",
+    "Get in touch: hello@onlymajors.com",
+  ];
+  return lines.filter((l, i, a) => !(l === "" && a[i - 1] === "")).join("\n");
+}
+
 // ───────── Email (Resend) helper ──────────────────────────────────────────
 // Provider-agnostic on purpose. If we ever switch to AWS SES or Postmark,
 // we swap the body of this function and every caller keeps working.
@@ -557,25 +653,35 @@ async function sendEmail({ to, subject, html, text, replyTo, tag }) {
 app.post("/api/admin/test-email", requireAuth, async (req, res) => {
   try {
     if (!req.user?.email) return res.status(400).json({ error: "no user email on session" });
+    const layoutArgs = {
+      preheader: "OnlyMajors pipeline test — looking good.",
+      heading:   "Pipeline is live.",
+      intro:     `If you're reading this, the Resend pipeline is wired correctly end to end — DKIM, SPF, the works — and ready to power every notification we have planned.`,
+      bodyHtml: `
+        <p style="color:${BRAND.body};font-size:14px;line-height:1.55;margin:0 0 8px;">Five notifications coming online:</p>
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:6px 0 8px;">
+          ${[
+            ["Picks Open",                  "Field set; pick your team"],
+            ["Wednesday close reminder",    "Last call before R1"],
+            ["End-of-round digest",         "Standings + your team's round"],
+            ["MC alert",                    "When a starter missed the cut"],
+            ["Saturday final-sub reminder", "Last sub window before Sunday"],
+          ].map(([k, v]) => `
+            <tr>
+              <td style="padding:6px 0;border-bottom:1px solid ${BRAND.rule};font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+                <span style="color:${BRAND.green};font-size:13px;font-weight:600;">${k}</span>
+                <span style="color:${BRAND.dim};font-size:13px;"> · ${v}</span>
+              </td>
+            </tr>`).join("")}
+        </table>`,
+      footerNote: "This is a one-off test — no action needed.",
+    };
     const result = await sendEmail({
       to:      req.user.email,
       subject: "OnlyMajors test email",
       tag:     "test",
-      html: `
-        <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:560px;margin:0 auto;padding:24px;color:#1a1a1a">
-          <h2 style="color:#2b4535;margin:0 0 12px">It works.</h2>
-          <p style="margin:0 0 12px;line-height:1.5">If you're reading this, the Resend pipeline is wired up correctly and ready to power the five notification types we discussed:</p>
-          <ul style="margin:0 0 16px;padding-left:20px;line-height:1.6">
-            <li>Picks open</li>
-            <li>Wednesday picks-close reminder</li>
-            <li>End-of-round digest</li>
-            <li>MC alert</li>
-            <li>Saturday final-sub reminder</li>
-          </ul>
-          <p style="margin:0;color:#666;font-size:13px">Sent from notify@onlymajors.com · Reply to hello@onlymajors.com</p>
-        </div>
-      `,
-      text: "If you're reading this, the OnlyMajors email pipeline is wired up correctly.",
+      html:    emailHtml(layoutArgs),
+      text:    emailText({ ...layoutArgs, bodyText: "Five notifications coming online: Picks Open, Wednesday close reminder, End-of-round digest, MC alert, Saturday final-sub reminder." }),
     });
     res.json({ ok: true, ...result });
   } catch (err) {
@@ -1789,7 +1895,10 @@ app.post("/api/auth/request-reset", async (req, res) => {
            VALUES ($1, $2, NOW() + INTERVAL '1 hour')`,
           [token, userId]
         );
-        const link = `${FRONTEND_URL}/reset?token=${encodeURIComponent(token)}`;
+        // Note: we route via the SPA's root with a ?reset= query param so
+        // Vercel doesn't 404 on an unknown /reset path. The frontend reads
+        // the query string regardless of which path it lands on.
+        const link = `${FRONTEND_URL}/?reset=${encodeURIComponent(token)}`;
         // Fire the email (best-effort — don't fail the request if email errors).
         sendEmail({
           to:      email,
