@@ -1913,6 +1913,28 @@ app.patch("/api/leagues/:id", requireAuth, async (req, res) => {
   res.json({ ok: true });
 });
 
+// DELETE /api/leagues/:id — commissioner deletes the league. Wipes picks,
+// chat, archives, and members; the leagues row goes last. EXPERTS (id=1) is
+// hard-protected.
+app.delete("/api/leagues/:id", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  const leagueId = Number(req.params.id);
+  if (!Number.isFinite(leagueId)) return res.status(400).json({ error: "invalid id" });
+  if (leagueId === 1) return res.status(403).json({ error: "EXPERTS can't be deleted" });
+  const ok = await requireCommissioner(req, res, leagueId);
+  if (ok == null) return;
+  try {
+    await pool.query(`DELETE FROM picks           WHERE league_id = $1`, [leagueId]);
+    await pool.query(`DELETE FROM chat_messages   WHERE league_id = $1`, [leagueId]);
+    await pool.query(`DELETE FROM season_archives WHERE league_id = $1`, [leagueId]);
+    await pool.query(`DELETE FROM league_members  WHERE league_id = $1`, [leagueId]);
+    await pool.query(`DELETE FROM leagues         WHERE id = $1`, [leagueId]);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // POST /api/leagues/:id/regenerate-code — commissioner gets a fresh code.
 app.post("/api/leagues/:id/regenerate-code", requireAuth, async (req, res) => {
   if (!requireDb(res)) return;
