@@ -206,6 +206,10 @@ async function initSchema() {
       ADD COLUMN IF NOT EXISTS visibility TEXT NOT NULL DEFAULT 'public';
     ALTER TABLE leagues
       ADD COLUMN IF NOT EXISTS commissioner_id BIGINT REFERENCES users(id) ON DELETE SET NULL;
+    ALTER TABLE leagues
+      ADD COLUMN IF NOT EXISTS league_type TEXT NOT NULL DEFAULT 'all_four';
+    ALTER TABLE leagues
+      ADD COLUMN IF NOT EXISTS included_majors JSONB NOT NULL DEFAULT '["masters","pga","usopen","open"]'::jsonb;
   `);
   // EXPERTS league keeps the legacy pre-allocated 5-slot model. Everything
   // else defaults to 'open' (no preset slots, members auto-added on join).
@@ -1693,14 +1697,25 @@ app.post("/api/leagues", async (req, res) => {
       }
     }
 
-    // Visibility from body (public default); commissioner = authed creator.
+    // Visibility, league type, included majors from body. Commissioner = authed creator.
     const visibility = (String(req.body?.visibility || "public").toLowerCase() === "private") ? "private" : "public";
+    const VALID_TYPES = new Set(["single_major","remaining_majors","all_four","four_plus_one"]);
+    let leagueType = String(req.body?.leagueType || "all_four");
+    if (!VALID_TYPES.has(leagueType)) leagueType = "all_four";
+    let included = Array.isArray(req.body?.includedMajors) ? req.body.includedMajors.filter(x => typeof x === "string") : null;
+    if (!included || !included.length) {
+      // Default included_majors by type
+      included = leagueType === "all_four"        ? ["masters","pga","usopen","open"]
+              : leagueType === "four_plus_one"    ? ["masters","pga","usopen","open","players"]
+              : leagueType === "remaining_majors" ? ["masters","pga","usopen","open"]
+              :                                     ["masters","pga","usopen","open"];
+    }
     const creatorEarly = await getOptionalUser(req);
     const lr = await client.query(
-      `INSERT INTO leagues (name, invite_code, format, scope, visibility, commissioner_id)
-       VALUES ($1, $2, 'season_money', 'season', $3, $4)
-       RETURNING id, name, invite_code, format, scope, major_id, visibility, commissioner_id, member_model`,
-      [rawName, code, visibility, creatorEarly?.id || null]
+      `INSERT INTO leagues (name, invite_code, format, scope, visibility, commissioner_id, league_type, included_majors)
+       VALUES ($1, $2, 'season_money', 'season', $3, $4, $5, $6::jsonb)
+       RETURNING id, name, invite_code, format, scope, major_id, visibility, commissioner_id, member_model, league_type, included_majors`,
+      [rawName, code, visibility, creatorEarly?.id || null, leagueType, JSON.stringify(included)]
     );
     const league = lr.rows[0];
     const leagueId = Number(league.id);
@@ -1738,6 +1753,8 @@ app.post("/api/leagues", async (req, res) => {
         visibility:     league.visibility,
         commissionerId: league.commissioner_id == null ? null : Number(league.commissioner_id),
         memberModel:    league.member_model || "open",
+        leagueType:     league.league_type,
+        includedMajors: league.included_majors,
       },
       members,
     });
@@ -2046,6 +2063,7 @@ app.get("/api/me/leagues-summary", requireAuth, async (req, res) => {
     const leagueRows = (await pool.query(
       `SELECT l.id, l.name, l.invite_code, l.format, l.scope, l.major_id,
               l.member_model, l.visibility, l.commissioner_id,
+              l.league_type, l.included_majors,
               lm.team_id, lm.team_name, lm.team_color
          FROM leagues l
          JOIN league_members lm ON lm.league_id = l.id
@@ -2109,6 +2127,8 @@ app.get("/api/me/leagues-summary", requireAuth, async (req, res) => {
           memberModel:    r.member_model || "open",
           visibility:     r.visibility   || "public",
           commissionerId: r.commissioner_id == null ? null : Number(r.commissioner_id),
+          leagueType:     r.league_type   || "all_four",
+          includedMajors: r.included_majors,
         },
         myTeam: {
           teamId:    r.team_id,
