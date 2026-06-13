@@ -150,6 +150,18 @@ async function initSchema() {
       email        TEXT,
       updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+
+    -- Season archives — historical per-year per-league snapshots, ingested
+    -- from PDFs / spreadsheets from past seasons. JSONB blob covers champion,
+    -- per-major winners, per-team totals & trophies. Schema is intentionally
+    -- loose so we can iterate the shape without DB migrations.
+    CREATE TABLE IF NOT EXISTS season_archives (
+      league_id   BIGINT NOT NULL REFERENCES leagues(id) ON DELETE CASCADE,
+      year        INT NOT NULL,
+      data        JSONB NOT NULL,
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (league_id, year)
+    );
   `);
 
   // SEED the default league FIRST so existing-row backfill below has a valid
@@ -212,6 +224,107 @@ async function initSchema() {
   `);
 
   console.log("✓  Postgres schema ready · default league seeded");
+  await seedHistoricalArchives();
+}
+
+// One-time seed of the EXPERTS league's historical season archives, sourced
+// from the league's PDFs. Inserts only the (league_id, year) rows that don't
+// already exist, so this is safe to run on every boot.
+async function seedHistoricalArchives() {
+  if (!pool) return;
+  const ARCHIVES = {
+    2022: {
+      champion: { teamId: "boo", teamName: "Team Boo", total: 11668618 },
+      majorWinners: {
+        masters: { teamId: "boo",   teamName: "Team Boo",   earnings: 3810000 },
+        pga:     { teamId: "larry", teamName: "Team Larry", earnings: 3434189 },
+        usopen:  { teamId: "boo",   teamName: "Team Boo",   earnings: 3497058 },
+        open:    { teamId: "caleb", teamName: "Team Caleb", earnings: 2831489 },
+      },
+      topEarner: { teamName: "Team Boo", majorShort: "Masters", amount: 3810000 },
+      teams: [
+        { teamId: "boo",    teamName: "Team Boo",    rank: 1, total: 11668618, byMajor: { masters: 3810000, pga: 2029643, usopen: 3497058, open: 2331917 } },
+        { teamId: "caleb",  teamName: "Team Caleb",  rank: 2, total:  7726213, byMajor: { masters:  675562, pga: 2919300, usopen: 1299862, open: 2831489 } },
+        { teamId: "larry",  teamName: "Team Larry",  rank: 3, total:  7535255, byMajor: { masters:  675750, pga: 3434189, usopen: 2715244, open:  710072 } },
+        { teamId: "thorne", teamName: "Team Thorne", rank: 4, total:  4376285, byMajor: { masters:  550350, pga: 1945514, usopen: 1148599, open:  731822 } },
+        { teamId: "austin", teamName: "Team Austin", rank: 5, total:  2848161, byMajor: { masters:  336333, pga:  817939, usopen: 1065910, open:  627979 } },
+      ],
+    },
+    2023: {
+      champion: { teamId: "thorne", teamName: "Team Thorne", total: 10516466 },
+      majorWinners: {
+        masters: { teamId: "thorne", teamName: "Team Thorne", earnings: 4749000 },
+        pga:     { teamId: "caleb",  teamName: "Team Caleb",  earnings: 3869750 },
+        usopen:  { teamId: "austin", teamName: "Team Austin", earnings: 2336778 },
+        open:    { teamId: "boo",    teamName: "Team Boo",    earnings: 3163067 },
+      },
+      topEarner: { teamName: "Team Thorne", majorShort: "Masters", amount: 4749000 },
+      teams: [
+        { teamId: "thorne", teamName: "Team Thorne", rank: 1, total: 10516466, byMajor: { masters: 4749000, pga: 3425900, usopen: 1689873, open:  651693 } },
+        { teamId: "caleb",  teamName: "Team Caleb",  rank: 2, total:  7146333, byMajor: { masters: 1402200, pga: 3869750, usopen: 1461041, open:  413342 } },
+        { teamId: "larry",  teamName: "Team Larry",  rank: 3, total:  6881473, byMajor: { masters: 4081200, pga:  379150, usopen: 1716781, open:  704342 } },
+        { teamId: "boo",    teamName: "Team Boo",    rank: 4, total:  5661610, byMajor: { masters: 1054800, pga:  592761, usopen:  850982, open: 3163067 } },
+        { teamId: "austin", teamName: "Team Austin", rank: 5, total:  5608167, byMajor: { masters: 1732500, pga:  394672, usopen: 2336778, open: 1144217 } },
+      ],
+    },
+    2024: {
+      // Austin took the season — totals reconciled against the final Open
+      // numbers (Austin ~$12.8M, Larry ~$12.5M, ~$250k margin).
+      champion: { teamId: "austin", teamName: "Team Austin", total: 12812710 },
+      majorWinners: {
+        masters: { teamId: "thorne", teamName: "Team Thorne", earnings: 4846000 },
+        pga:     { teamId: "larry",  teamName: "Team Larry",  earnings: 6159202 },
+        usopen:  { teamId: "caleb",  teamName: "Team Caleb",  earnings: 5570337 },
+        open:    { teamId: "thorne", teamName: "Team Thorne", earnings: 1286300 },
+      },
+      topEarner: { teamName: "Team Larry", majorShort: "PGA", amount: 6159202 },
+      teams: [
+        { teamId: "austin", teamName: "Team Austin", rank: 1, total: 12812710, byMajor: { masters: 4453000, pga: 4684387, usopen: 2858180, open:  817143 } },
+        { teamId: "larry",  teamName: "Team Larry",  rank: 2, total: 12560367, byMajor: { masters: 4670900, pga: 6159202, usopen: 1065408, open:  664857 } },
+        { teamId: "caleb",  teamName: "Team Caleb",  rank: 3, total: 12351598, byMajor: { masters: 4401400, pga: 1695361, usopen: 5570337, open:  684500 } },
+        { teamId: "thorne", teamName: "Team Thorne", rank: 4, total: 10457459, byMajor: { masters: 4846000, pga: 2543088, usopen: 1782071, open: 1286300 } },
+        { teamId: "boo",    teamName: "Team Boo",    rank: 5, total:  5832833, byMajor: { masters:  887500, pga:  828525, usopen: 3387408, open:  729400 } },
+      ],
+    },
+    2025: {
+      champion: { teamId: "boo", teamName: "Team Boo", total: 9923712 },
+      majorWinners: {
+        // Larry + Caleb tied at $6,342,000 for the Masters; the PDF highlights
+        // Larry as the winner.
+        masters: { teamId: "larry",  teamName: "Team Larry",  earnings: 6342000 },
+        pga:     { teamId: "boo",    teamName: "Team Boo",    earnings: 5003677 },
+        usopen:  { teamId: "caleb",  teamName: "Team Caleb",  earnings: 1429327 },
+        open:    { teamId: "thorne", teamName: "Team Thorne", earnings: 1553017 },
+      },
+      topEarner: { teamName: "Team Larry", majorShort: "Masters", amount: 6342000 },
+      teams: [
+        { teamId: "boo",    teamName: "Team Boo",    rank: 1, total: 9923712, byMajor: { masters: 2929500, pga: 5003677, usopen:  716351, open: 1274184 } },
+        { teamId: "larry",  teamName: "Team Larry",  rank: 2, total: 8932433, byMajor: { masters: 6342000, pga:  531082, usopen:  772910, open: 1286441 } },
+        { teamId: "thorne", teamName: "Team Thorne", rank: 3, total: 8245571, byMajor: { masters:  835800, pga: 4838667, usopen: 1018087, open: 1553017 } },
+        { teamId: "caleb",  teamName: "Team Caleb",  rank: 4, total: 8153359, byMajor: { masters: 6342000, pga:  156494, usopen: 1429327, open:  225538 } },
+        { teamId: "austin", teamName: "Team Austin", rank: 5, total: 7273112, byMajor: { masters: 1218000, pga: 3562835, usopen: 1038001, open: 1454276 } },
+      ],
+    },
+  };
+
+  try {
+    const existing = await pool.query(
+      `SELECT year FROM season_archives WHERE league_id = $1`,
+      [DEFAULT_LEAGUE_ID]
+    );
+    const have = new Set(existing.rows.map(r => Number(r.year)));
+    for (const [yearStr, data] of Object.entries(ARCHIVES)) {
+      const year = Number(yearStr);
+      if (have.has(year)) continue;
+      await pool.query(
+        `INSERT INTO season_archives (league_id, year, data) VALUES ($1, $2, $3::jsonb)`,
+        [DEFAULT_LEAGUE_ID, year, JSON.stringify(data)]
+      );
+      console.log(`✓  seeded ${year} archive for EXPERTS league`);
+    }
+  } catch (err) {
+    console.warn("⚠  historical archive seed failed:", err.message);
+  }
 }
 
 initSchema().catch(e => console.error("✖  schema init failed:", e.message));
@@ -1537,6 +1650,52 @@ app.post("/api/leagues", async (req, res) => {
   }
 });
 
+// GET /api/leagues/:leagueId/archive — full season archive for a league
+//   returns { years: [{ year, data }] }, newest year first
+app.get("/api/leagues/:leagueId/archive", async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const { rows } = await pool.query(
+      `SELECT year, data FROM season_archives
+        WHERE league_id = $1
+        ORDER BY year DESC`,
+      [req.params.leagueId]
+    );
+    res.json({
+      years: rows.map(r => ({ year: Number(r.year), data: r.data })),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/leagues/:leagueId/archive/:year — ingest a year's data (auth
+// required; user must be a member of the league). Used to seed historical
+// PDFs / spreadsheets. Body is the full JSONB blob — we don't lock down the
+// shape so the format can evolve.
+app.post("/api/leagues/:leagueId/archive/:year", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const leagueId = await resolveLeagueId(req.user.id, req.params.leagueId);
+    if (leagueId == null) return res.status(403).json({ error: "not a member of that league" });
+    const year = Number(req.params.year);
+    if (!Number.isFinite(year) || year < 1990 || year > 2100) {
+      return res.status(400).json({ error: "invalid year" });
+    }
+    const data = req.body || {};
+    await pool.query(
+      `INSERT INTO season_archives (league_id, year, data, updated_at)
+       VALUES ($1, $2, $3::jsonb, NOW())
+       ON CONFLICT (league_id, year)
+       DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
+      [leagueId, year, JSON.stringify(data)]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // GET /api/me/leagues-summary — one round trip with everything the Hub needs
 // to render rich cards for each league the user is in: league info, my team,
 // full members list, and per-team-per-major picks. The frontend uses its
@@ -1637,6 +1796,7 @@ app.listen(PORT, async () => {
   console.log(`   GET    /api/me  /api/leagues/:id/members`);
   console.log(`   GET    /api/leagues/by-code/:code   POST /api/leagues`);
   console.log(`   GET    /api/me/leagues-summary`);
+  console.log(`   GET    /api/leagues/:id/archive   POST /api/leagues/:id/archive/:year`);
   console.log(`   GET    /api/health`);
   console.log(`   CORS allowed: ${ALLOWED_ORIGINS.join(", ")}`);
   // Wait for the schema to be ready, then rehydrate snapshots from DB.
