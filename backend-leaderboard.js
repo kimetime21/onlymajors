@@ -45,6 +45,15 @@ const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || "https://onlymajors.com,htt
 const DATABASE_URL = process.env.DATABASE_URL;
 const DEFAULT_LEAGUE_ID = 1;       // "Experts PGA Fantasy" — auto-seeded on first boot
 
+// ───────── Email (Resend) ─────────────────────────────────────────────────
+const RESEND_API_KEY = process.env.RESEND_API_KEY;
+const EMAIL_FROM     = process.env.EMAIL_FROM     || "OnlyMajors <notify@onlymajors.com>";
+const EMAIL_REPLY_TO = process.env.EMAIL_REPLY_TO || "hello@onlymajors.com";
+const EMAIL_ENABLED  = Boolean(RESEND_API_KEY);
+if (!EMAIL_ENABLED) {
+  console.warn("⚠  RESEND_API_KEY not set — email notifications disabled");
+}
+
 if (!DG_KEY) {
   console.error("✖  DATAGOLF_API_KEY env var not set — exiting");
   process.exit(1);
@@ -493,6 +502,77 @@ function requireAuth(req, res, next) {
   if (!req.user) return res.status(401).json({ error: "auth required" });
   next();
 }
+
+// ───────── Email (Resend) helper ──────────────────────────────────────────
+// Provider-agnostic on purpose. If we ever switch to AWS SES or Postmark,
+// we swap the body of this function and every caller keeps working.
+async function sendEmail({ to, subject, html, text, replyTo, tag }) {
+  if (!EMAIL_ENABLED) {
+    console.warn(`[email] skipped — no RESEND_API_KEY (would have sent: "${subject}" → ${to})`);
+    return { skipped: true };
+  }
+  if (!to || !subject || (!html && !text)) {
+    throw new Error("sendEmail requires { to, subject, html|text }");
+  }
+  const payload = {
+    from:     EMAIL_FROM,
+    to:       Array.isArray(to) ? to : [to],
+    subject,
+    reply_to: replyTo || EMAIL_REPLY_TO,
+    ...(html ? { html } : {}),
+    ...(text ? { text } : {}),
+    ...(tag  ? { tags: [{ name: "type", value: tag }] } : {}),
+  };
+  const resp = await fetch("https://api.resend.com/emails", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${RESEND_API_KEY}`,
+      "Content-Type":  "application/json",
+    },
+    body: JSON.stringify(payload),
+  });
+  const body = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    console.error(`[email] Resend ${resp.status}:`, body);
+    throw new Error(body?.message || `Resend returned ${resp.status}`);
+  }
+  console.log(`[email] sent "${subject}" → ${to} (id=${body.id})`);
+  return { id: body.id };
+}
+
+// Admin-only test endpoint to verify the email pipeline end-to-end.
+// Call from any logged-in browser via the dev console or curl:
+//   curl -X POST https://api.onlymajors.com/api/admin/test-email \
+//     -H "Authorization: Bearer $TOKEN"
+app.post("/api/admin/test-email", requireAuth, async (req, res) => {
+  try {
+    if (!req.user?.email) return res.status(400).json({ error: "no user email on session" });
+    const result = await sendEmail({
+      to:      req.user.email,
+      subject: "OnlyMajors test email",
+      tag:     "test",
+      html: `
+        <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:560px;margin:0 auto;padding:24px;color:#1a1a1a">
+          <h2 style="color:#2b4535;margin:0 0 12px">It works.</h2>
+          <p style="margin:0 0 12px;line-height:1.5">If you're reading this, the Resend pipeline is wired up correctly and ready to power the five notification types we discussed:</p>
+          <ul style="margin:0 0 16px;padding-left:20px;line-height:1.6">
+            <li>Picks open</li>
+            <li>Wednesday picks-close reminder</li>
+            <li>End-of-round digest</li>
+            <li>MC alert</li>
+            <li>Saturday final-sub reminder</li>
+          </ul>
+          <p style="margin:0;color:#666;font-size:13px">Sent from notify@onlymajors.com · Reply to hello@onlymajors.com</p>
+        </div>
+      `,
+      text: "If you're reading this, the OnlyMajors email pipeline is wired up correctly.",
+    });
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error("[admin/test-email] failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // Resolve the team_id the authenticated user owns in the given league.
 async function getUserTeamId(userId, leagueId = DEFAULT_LEAGUE_ID) {
@@ -1346,16 +1426,37 @@ app.put("/api/profiles/:teamId", requireAuth, async (req, res) => {
   if (!requireDb(res)) return;
   const { teamId } = req.params;
   const { displayName = null, teamName = null, email = null } = req.body || {};
+  // If an email is provided, it must look like an email. (Null/empty means
+  // "no change to email" — we don't blank out a user's login by accident.)
+  const cleanEmail = (typeof email === "string" && email.trim()) ? email.trim().toLowerCase() : null;
+  if (cleanEmail && !isValidEmail(cleanEmail)) {
+    return res.status(400).json({ error: "That email doesn't look valid." });
+  }
+  const client = await pool.connect();
   try {
     // Ownership: the user must own this team_id in ANY of their leagues.
-    const ownership = await pool.query(
+    const ownership = await client.query(
       `SELECT 1 FROM league_members WHERE user_id = $1 AND team_id = $2 LIMIT 1`,
       [req.user.id, teamId]
     );
     if (!ownership.rows.length) {
       return res.status(403).json({ error: "you can only edit your own profile" });
     }
-    await pool.query(
+    // Uniqueness check — Postgres will throw on the UPDATE below if the
+    // email is already taken by another user, but we surface a friendlier
+    // 409 before we even open the transaction.
+    if (cleanEmail) {
+      const dupe = await client.query(
+        `SELECT 1 FROM users WHERE lower(email) = $1 AND id <> $2 LIMIT 1`,
+        [cleanEmail, req.user.id]
+      );
+      if (dupe.rows.length) {
+        return res.status(409).json({ error: "That email is already in use by another account." });
+      }
+    }
+    await client.query("BEGIN");
+    // 1) Per-team profile row (display name, team name, contact email).
+    await client.query(
       `INSERT INTO profiles (team_id, display_name, team_name, email, updated_at)
        VALUES ($1, $2, $3, $4, NOW())
        ON CONFLICT (team_id)
@@ -1363,11 +1464,36 @@ app.put("/api/profiles/:teamId", requireAuth, async (req, res) => {
                      team_name    = EXCLUDED.team_name,
                      email        = EXCLUDED.email,
                      updated_at   = NOW()`,
-      [teamId, displayName, teamName, email]
+      [teamId, displayName, teamName, cleanEmail]
     );
-    res.json({ ok: true });
+    // 2) Login email on the user row — only if the caller actually supplied
+    //    a new email (so renaming a team doesn't accidentally touch login).
+    if (cleanEmail) {
+      await client.query(
+        `UPDATE users SET email = $1 WHERE id = $2`,
+        [cleanEmail, req.user.id]
+      );
+    }
+    // 3) Display name lives on the user row too; keep them in sync if the
+    //    caller sent one.
+    if (typeof displayName === "string" && displayName.trim()) {
+      await client.query(
+        `UPDATE users SET display_name = $1 WHERE id = $2`,
+        [displayName.trim(), req.user.id]
+      );
+    }
+    await client.query("COMMIT");
+    res.json({ ok: true, email: cleanEmail || undefined });
   } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    // Postgres unique_violation surfaces as code 23505 even if we missed it above.
+    if (err.code === "23505") {
+      return res.status(409).json({ error: "That email is already in use by another account." });
+    }
+    console.error("[PUT /api/profiles] failed:", err);
     res.status(500).json({ error: err.message });
+  } finally {
+    client.release();
   }
 });
 
@@ -1567,6 +1693,47 @@ app.get("/api/me", requireAuth, async (req, res) => {
     const payload = await meAndLeagues(req.user.id);
     res.json(payload);
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/auth/change-password
+//   body: { currentPassword, newPassword }
+// Verifies current password, sets new hash, and revokes all OTHER sessions
+// (current one survives so the user doesn't get logged out of the device
+// they're using). Returns ok on success.
+app.post("/api/auth/change-password", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  const { currentPassword, newPassword } = req.body || {};
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ error: "current and new passwords are both required" });
+  }
+  if (typeof newPassword !== "string" || newPassword.length < 8) {
+    return res.status(400).json({ error: "new password must be at least 8 characters" });
+  }
+  if (newPassword === currentPassword) {
+    return res.status(400).json({ error: "new password must be different from current password" });
+  }
+  try {
+    const { rows } = await pool.query(
+      `SELECT password_hash FROM users WHERE id = $1`, [req.user.id]
+    );
+    if (!rows.length || !verifyPassword(currentPassword, rows[0].password_hash)) {
+      return res.status(401).json({ error: "current password is incorrect" });
+    }
+    await pool.query(
+      `UPDATE users SET password_hash = $1 WHERE id = $2`,
+      [hashPassword(newPassword), req.user.id]
+    );
+    // Security: revoke every OTHER session — anyone signed in elsewhere
+    // (e.g. an old phone) gets kicked. Current device's session stays alive.
+    await pool.query(
+      `DELETE FROM sessions WHERE user_id = $1 AND token <> $2`,
+      [req.user.id, req.token]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[change-password] failed:", err);
     res.status(500).json({ error: err.message });
   }
 });
