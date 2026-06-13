@@ -44,6 +44,7 @@ const SESSION_TTL_DAYS = 30;
 const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || "https://onlymajors.com,https://www.onlymajors.com").split(",");
 const DATABASE_URL = process.env.DATABASE_URL;
 const DEFAULT_LEAGUE_ID = 1;       // "Experts PGA Fantasy" — auto-seeded on first boot
+const FRONTEND_URL = process.env.FRONTEND_URL || "https://onlymajors.com";
 
 // ───────── Email (Resend) ─────────────────────────────────────────────────
 const RESEND_API_KEY = process.env.RESEND_API_KEY;
@@ -118,6 +119,15 @@ async function initSchema() {
       expires_at  TIMESTAMPTZ NOT NULL,
       created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS password_resets (
+      token       TEXT PRIMARY KEY,
+      user_id     BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      expires_at  TIMESTAMPTZ NOT NULL,
+      used_at     TIMESTAMPTZ,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_password_resets_user ON password_resets (user_id);
 
     CREATE TABLE IF NOT EXISTS picks (
       team_id    TEXT NOT NULL,
@@ -1734,6 +1744,132 @@ app.post("/api/auth/change-password", requireAuth, async (req, res) => {
     res.json({ ok: true });
   } catch (err) {
     console.error("[change-password] failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/auth/request-reset
+//   body: { email }
+// Generates a single-use 1-hour reset token and emails the user a link.
+// ALWAYS returns 200 — never leaks whether the email exists in the system
+// (would let attackers enumerate registered emails). Light throttle to one
+// active token per user at a time.
+app.post("/api/auth/request-reset", async (req, res) => {
+  if (!requireDb(res)) return;
+  const email = (req.body?.email || "").trim().toLowerCase();
+  if (!isValidEmail(email)) {
+    // Same shape as success — don't tip attackers off.
+    return res.json({ ok: true });
+  }
+  try {
+    const { rows } = await pool.query(
+      `SELECT id FROM users WHERE lower(email) = $1 LIMIT 1`, [email]
+    );
+    if (rows.length) {
+      const userId = rows[0].id;
+      // Throttle: if there's a token issued in the last 60s for this user,
+      // don't issue another one. Prevents abuse via the request form.
+      const recent = await pool.query(
+        `SELECT 1 FROM password_resets
+          WHERE user_id = $1 AND created_at > NOW() - INTERVAL '60 seconds'
+          LIMIT 1`,
+        [userId]
+      );
+      if (!recent.rows.length) {
+        // Invalidate any previous unused tokens for this user — only the
+        // freshest link should work.
+        await pool.query(
+          `UPDATE password_resets SET used_at = NOW()
+            WHERE user_id = $1 AND used_at IS NULL`,
+          [userId]
+        );
+        const token = crypto.randomBytes(32).toString("hex");
+        await pool.query(
+          `INSERT INTO password_resets (token, user_id, expires_at)
+           VALUES ($1, $2, NOW() + INTERVAL '1 hour')`,
+          [token, userId]
+        );
+        const link = `${FRONTEND_URL}/reset?token=${encodeURIComponent(token)}`;
+        // Fire the email (best-effort — don't fail the request if email errors).
+        sendEmail({
+          to:      email,
+          subject: "Reset your OnlyMajors password",
+          tag:     "password-reset",
+          html: `
+            <div style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;max-width:560px;margin:0 auto;padding:24px;color:#1a1a1a">
+              <h2 style="color:#2b4535;margin:0 0 12px">Password reset</h2>
+              <p style="margin:0 0 16px;line-height:1.5">Someone asked to reset the password for your OnlyMajors account. If that was you, tap the button below to set a new one. The link expires in <strong>1 hour</strong>.</p>
+              <p style="margin:0 0 24px"><a href="${link}" style="display:inline-block;background:#2b4535;color:#fff;padding:11px 22px;border-radius:8px;text-decoration:none;font-weight:600">Set a new password</a></p>
+              <p style="margin:0 0 8px;color:#666;font-size:13px;line-height:1.5">Or paste this URL into your browser:</p>
+              <p style="margin:0 0 24px;word-break:break-all;font-size:12px;color:#888"><a href="${link}" style="color:#2b4535">${link}</a></p>
+              <p style="margin:0;color:#888;font-size:12px;line-height:1.5">If you didn't request this, you can safely ignore the email — your password stays the same.</p>
+            </div>
+          `,
+          text: `Reset your OnlyMajors password\n\nVisit this link within 1 hour to set a new password:\n${link}\n\nIf you didn't request this, ignore the email.`,
+        }).catch(e => console.error("[request-reset] email send failed:", e.message));
+      }
+    }
+    // Always 200, no matter what.
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[request-reset] failed:", err);
+    // Still return 200 to avoid leaking via timing/error.
+    res.json({ ok: true });
+  }
+});
+
+// POST /api/auth/reset-password
+//   body: { token, newPassword }
+// Validates the token (exists, not expired, not used), swaps the password
+// hash, marks the token used, and revokes EVERY session for that user
+// (because an unknown party may have been logged in elsewhere).
+app.post("/api/auth/reset-password", async (req, res) => {
+  if (!requireDb(res)) return;
+  const { token, newPassword } = req.body || {};
+  if (!token || !newPassword) {
+    return res.status(400).json({ error: "token and new password are required" });
+  }
+  if (typeof newPassword !== "string" || newPassword.length < 8) {
+    return res.status(400).json({ error: "new password must be at least 8 characters" });
+  }
+  try {
+    const { rows } = await pool.query(
+      `SELECT user_id, expires_at, used_at FROM password_resets WHERE token = $1`,
+      [token]
+    );
+    if (!rows.length) {
+      return res.status(400).json({ error: "That reset link is invalid." });
+    }
+    const row = rows[0];
+    if (row.used_at) {
+      return res.status(400).json({ error: "That reset link has already been used." });
+    }
+    if (new Date(row.expires_at) < new Date()) {
+      return res.status(400).json({ error: "That reset link has expired. Request a new one." });
+    }
+    const userId = row.user_id;
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `UPDATE users SET password_hash = $1 WHERE id = $2`,
+        [hashPassword(newPassword), userId]
+      );
+      await client.query(
+        `UPDATE password_resets SET used_at = NOW() WHERE token = $1`, [token]
+      );
+      // Boot every session — if an attacker was already inside, they're out.
+      await client.query(`DELETE FROM sessions WHERE user_id = $1`, [userId]);
+      await client.query("COMMIT");
+    } catch (e) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[reset-password] failed:", err);
     res.status(500).json({ error: err.message });
   }
 });
