@@ -210,7 +210,13 @@ async function initSchema() {
       ADD COLUMN IF NOT EXISTS league_type TEXT NOT NULL DEFAULT 'all_four';
     ALTER TABLE leagues
       ADD COLUMN IF NOT EXISTS included_majors JSONB NOT NULL DEFAULT '["masters","pga","usopen","open"]'::jsonb;
+    ALTER TABLE leagues
+      ADD COLUMN IF NOT EXISTS founded_year INT;
   `);
+  // Pin EXPERTS to its real founding year so the Hub card reads "Since 2022".
+  await pool.query(`UPDATE leagues SET founded_year = 2022 WHERE id = 1 AND founded_year IS NULL`);
+  // Backfill any league without a founded_year using its created_at row.
+  await pool.query(`UPDATE leagues SET founded_year = EXTRACT(YEAR FROM created_at)::int WHERE founded_year IS NULL`);
   // EXPERTS league keeps the legacy pre-allocated 5-slot model. Everything
   // else defaults to 'open' (no preset slots, members auto-added on join).
   await pool.query(`UPDATE leagues SET member_model = 'slots' WHERE id = $1`, [1]);
@@ -1712,9 +1718,9 @@ app.post("/api/leagues", async (req, res) => {
     }
     const creatorEarly = await getOptionalUser(req);
     const lr = await client.query(
-      `INSERT INTO leagues (name, invite_code, format, scope, visibility, commissioner_id, league_type, included_majors)
-       VALUES ($1, $2, 'season_money', 'season', $3, $4, $5, $6::jsonb)
-       RETURNING id, name, invite_code, format, scope, major_id, visibility, commissioner_id, member_model, league_type, included_majors`,
+      `INSERT INTO leagues (name, invite_code, format, scope, visibility, commissioner_id, league_type, included_majors, founded_year)
+       VALUES ($1, $2, 'season_money', 'season', $3, $4, $5, $6::jsonb, EXTRACT(YEAR FROM NOW())::int)
+       RETURNING id, name, invite_code, format, scope, major_id, visibility, commissioner_id, member_model, league_type, included_majors, founded_year`,
       [rawName, code, visibility, creatorEarly?.id || null, leagueType, JSON.stringify(included)]
     );
     const league = lr.rows[0];
@@ -1755,6 +1761,7 @@ app.post("/api/leagues", async (req, res) => {
         memberModel:    league.member_model || "open",
         leagueType:     league.league_type,
         includedMajors: league.included_majors,
+        foundedYear:    league.founded_year || new Date().getFullYear(),
       },
       members,
     });
@@ -2085,7 +2092,7 @@ app.get("/api/me/leagues-summary", requireAuth, async (req, res) => {
     const leagueRows = (await pool.query(
       `SELECT l.id, l.name, l.invite_code, l.format, l.scope, l.major_id,
               l.member_model, l.visibility, l.commissioner_id,
-              l.league_type, l.included_majors,
+              l.league_type, l.included_majors, l.founded_year,
               lm.team_id, lm.team_name, lm.team_color
          FROM leagues l
          JOIN league_members lm ON lm.league_id = l.id
@@ -2151,6 +2158,7 @@ app.get("/api/me/leagues-summary", requireAuth, async (req, res) => {
           commissionerId: r.commissioner_id == null ? null : Number(r.commissioner_id),
           leagueType:     r.league_type   || "all_four",
           includedMajors: r.included_majors,
+          foundedYear:    r.founded_year   || null,
         },
         myTeam: {
           teamId:    r.team_id,
