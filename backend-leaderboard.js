@@ -1039,7 +1039,7 @@ async function checkWedReminderForMajor(majorId) {
 // ───────── Round wrap digest (R1, R2, R3, R4) ─────────────────────────────
 // Per-user digest stacking each league the user is in, summarizing the
 // round that just finished. Idempotent per (user, major, round).
-async function sendRoundWrapEmail(user, major, round, leagueLines, mcAlertHtml) {
+async function sendRoundWrapEmail(user, major, round, leagueLines, mcAlertHtml, clubChampBlock) {
   const ctaUrl = `${FRONTEND_URL}/?utm_source=email&utm_campaign=round_wrap&utm_content=${major.id}_r${round}`;
   const isFinal = round === 4;
   const layoutArgs = {
@@ -1050,7 +1050,9 @@ async function sendRoundWrapEmail(user, major, round, leagueLines, mcAlertHtml) 
                         : `Round ${round} is in the books. Here's where you stand.`,
     ctaLabel:   isFinal ? "See final standings" : "Open the live leaderboard",
     ctaUrl,
-    bodyHtml:   `${mcAlertHtml || ""}${leagueLines}`,
+    // Order: MC alert (R2 only) → per-league lines → Club Championship block.
+    // Each piece returns "" when it has nothing to render.
+    bodyHtml:   `${mcAlertHtml || ""}${leagueLines || ""}${clubChampBlock || ""}`,
     footerNote: isFinal ? "Season averages update automatically." : "Manage round-end digests in Settings.",
   };
   return sendEmail({
@@ -1110,7 +1112,11 @@ async function checkRoundWrapForMajor(majorId) {
     const reserved = await reserveNotification({ userId: u.id, kind: "round_wrap", majorId, round: triggerRound });
     if (!reserved) continue;
     try {
-      const { id } = await sendRoundWrapEmail({ email: u.email, displayName: u.display_name }, { id: majorId, ...meta }, triggerRound, leagueLines, mcAlertHtml);
+      // Club Championship roster summary — only renders if the user is
+      // enrolled. Returns "" today (feature-flagged off until enrollment
+      // backend ships, task #153).
+      const clubChampBlock = await buildClubChampBlock(u.id, majorId, triggerRound);
+      const { id } = await sendRoundWrapEmail({ email: u.email, displayName: u.display_name }, { id: majorId, ...meta }, triggerRound, leagueLines, mcAlertHtml, clubChampBlock);
       if (id) {
         await pool.query(
           `UPDATE notification_log SET message_id = $1
@@ -1135,6 +1141,67 @@ async function checkRoundWrapForMajor(majorId) {
   }
   if (results.total > 0) console.log(`[round_wrap] ${majorId} R${triggerRound}: sent=${results.sent} failed=${results.failed} total=${results.total}`);
   return results;
+}
+
+// Club Championship roster block — included in the round-wrap digest when
+// the user has entered the platform-wide contest for the focus major.
+// Pulls the user's 6-starter roster, their current total, and their rank
+// out of the contest leaderboard. Returns "" if they're not entered, the
+// contest backend hasn't been built yet, or anything errors.
+async function buildClubChampBlock(userId, majorId, round) {
+  try {
+    // Schema/data for the Club Championship isn't live yet — bail until
+    // the enrollment + scoring tables (task #153) are wired up. When that
+    // ships, this query is what we'll uncomment:
+    //
+    //   const { rows } = await pool.query(`
+    //     SELECT cce.starters, cce.score_prediction, ccr.total, ccr.rank,
+    //            (SELECT COUNT(*) FROM club_championship_entries WHERE major_id = $2) AS field_size
+    //       FROM club_championship_entries cce
+    //       LEFT JOIN club_championship_results ccr
+    //              ON ccr.user_id = cce.user_id AND ccr.major_id = cce.major_id
+    //      WHERE cce.user_id = $1 AND cce.major_id = $2`,
+    //     [userId, majorId]);
+    //   if (!rows.length) return "";
+    //   const entry = rows[0];
+    //   …build the HTML block…
+    //
+    // For now: feature flag off.
+    return "";
+  } catch (err) {
+    console.error("[club_champ_block] failed for user", userId, err.message);
+    return "";
+  }
+}
+
+// Helper that renders the Club Championship block given a populated entry
+// object. Kept separate from the data fetch so the round-wrap test endpoint
+// can pass mock data through it.
+function renderClubChampBlock({ rank, fieldSize, total, roster, round }) {
+  const fmtM = (n) => n == null ? "—" : `$${(n/1e6).toFixed(2)}M`;
+  const fmtK = (n) => n == null ? "—" : (n >= 1e6 ? `$${(n/1e6).toFixed(2)}M` : `$${Math.round(n/1000)}K`);
+  const rosterRows = (roster || []).map(r => `
+    <tr>
+      <td style="padding:4px 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+        <span style="color:${BRAND.body};font-size:13px;">${r.name}</span>
+      </td>
+      <td style="padding:4px 0;text-align:right;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+        <span style="color:${BRAND.ink};font-size:13px;font-weight:600;">${fmtK(r.total)}</span>
+      </td>
+    </tr>`).join("");
+  return `
+    <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:18px 0 0;background:${BRAND.creamSoft};border:1px solid ${BRAND.rule};border-radius:8px;">
+      <tr><td style="padding:14px 16px;">
+        <div style="color:${BRAND.dim};font-size:10px;text-transform:uppercase;letter-spacing:0.18em;font-weight:600;">Club Championship</div>
+        <div style="margin-top:4px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+          <span style="color:${BRAND.ink};font-size:18px;font-weight:700;">${fmtM(total)}</span>
+          <span style="color:${BRAND.dim};font-size:13px;margin-left:6px;">#${rank} of ${fieldSize}</span>
+        </div>
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-top:10px;border-top:1px solid ${BRAND.rule};">
+          ${rosterRows}
+        </table>
+      </td></tr>
+    </table>`;
 }
 
 // MC alert block — piggybacks on the R2 round-wrap. Returns "" if the user
