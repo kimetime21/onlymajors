@@ -94,6 +94,27 @@ async function initSchema() {
       )
     `);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS member_number INT`);
+    // First / last name fields. Display name remains the public handle and
+    // defaults to "First L." when not customized. display_name_customized
+    // marks whether the user has manually edited it (so name changes can
+    // auto-update the default without overwriting a chosen handle).
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name  TEXT`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name_customized BOOLEAN NOT NULL DEFAULT false`);
+    // Backfill first / last from existing display_name on a best-effort basis
+    // (split on whitespace; one-token names become first_name only).
+    await pool.query(`
+      UPDATE users
+         SET first_name = COALESCE(first_name, NULLIF(split_part(display_name, ' ', 1), '')),
+             last_name  = COALESCE(last_name,
+                NULLIF(
+                  CASE WHEN position(' ' in display_name) > 0
+                       THEN substring(display_name from position(' ' in display_name) + 1)
+                       ELSE NULL END
+                , ''))
+       WHERE display_name IS NOT NULL
+         AND (first_name IS NULL OR last_name IS NULL)
+    `);
     await pool.query(`
       DO $$ BEGIN
         IF NOT EXISTS (
@@ -2230,7 +2251,8 @@ app.get("/api/profiles", async (req, res) => {
 app.put("/api/profiles/:teamId", requireAuth, async (req, res) => {
   if (!requireDb(res)) return;
   const { teamId } = req.params;
-  const { displayName = null, teamName = null, email = null } = req.body || {};
+  const { displayName = null, teamName = null, email = null,
+          firstName = null, lastName = null } = req.body || {};
   // If an email is provided, it must look like an email. (Null/empty means
   // "no change to email" — we don't blank out a user's login by accident.)
   const cleanEmail = (typeof email === "string" && email.trim()) ? email.trim().toLowerCase() : null;
@@ -2279,13 +2301,40 @@ app.put("/api/profiles/:teamId", requireAuth, async (req, res) => {
         [cleanEmail, req.user.id]
       );
     }
-    // 3) Display name lives on the user row too; keep them in sync if the
-    //    caller sent one.
+    // 3) Display name + first/last sync on the user row. Rules:
+    //    - If the caller sent firstName / lastName, persist those.
+    //    - If the caller sent displayName, treat it as a customization and
+    //      mark display_name_customized = true so future name edits don't
+    //      overwrite it.
+    //    - If the caller updated names but NOT the display name, regenerate
+    //      the default ("First L.") — but only if the user hadn't already
+    //      customized their handle.
+    const fName = typeof firstName === "string" ? firstName.trim() : null;
+    const lName = typeof lastName  === "string" ? lastName.trim()  : null;
+    if (fName !== null) {
+      await client.query(`UPDATE users SET first_name = NULLIF($1, '') WHERE id = $2`, [fName, req.user.id]);
+    }
+    if (lName !== null) {
+      await client.query(`UPDATE users SET last_name = NULLIF($1, '') WHERE id = $2`, [lName, req.user.id]);
+    }
     if (typeof displayName === "string" && displayName.trim()) {
       await client.query(
-        `UPDATE users SET display_name = $1 WHERE id = $2`,
+        `UPDATE users SET display_name = $1, display_name_customized = true WHERE id = $2`,
         [displayName.trim(), req.user.id]
       );
+    } else if (fName !== null || lName !== null) {
+      // Names changed but no explicit display name — only regenerate the
+      // default if the user hasn't customized their handle.
+      const row = (await client.query(
+        `SELECT first_name, last_name, display_name_customized FROM users WHERE id = $1`,
+        [req.user.id]
+      )).rows[0];
+      if (row && !row.display_name_customized) {
+        const next = deriveDisplayName(row.first_name, row.last_name);
+        if (next) {
+          await client.query(`UPDATE users SET display_name = $1 WHERE id = $2`, [next, req.user.id]);
+        }
+      }
     }
     await client.query("COMMIT");
     res.json({ ok: true, email: cleanEmail || undefined });
@@ -2306,17 +2355,28 @@ app.put("/api/profiles/:teamId", requireAuth, async (req, res) => {
 // Auth routes — signup, login, logout, /me, /leagues/mine
 // ─────────────────────────────────────────────────────────────
 // Helper: return current user + their league memberships
+// Default display name = "First L." (e.g. "Austin K."). One-token names
+// just become "First". Empty input → null so callers can fall back to email.
+function deriveDisplayName(first, last) {
+  const f = (first || "").trim();
+  const l = (last  || "").trim();
+  if (!f && !l) return null;
+  if (!l) return f;
+  return `${f} ${l[0].toUpperCase()}.`;
+}
+
 async function meAndLeagues(userId) {
-  // Fault-tolerant SELECT — if member_number column hasn't migrated yet on
-  // a given environment, fall back to the legacy shape so auth still works.
+  // Fault-tolerant SELECT — if first_name / last_name haven't migrated yet
+  // on a given environment, fall back to the older shape so auth still works.
   let userRow;
   try {
     userRow = (await pool.query(
-      `SELECT id, email, display_name, member_number FROM users WHERE id = $1`, [userId]
+      `SELECT id, email, display_name, member_number, first_name, last_name, display_name_customized
+         FROM users WHERE id = $1`, [userId]
     )).rows[0];
   } catch (err) {
     if (err.code === "42703" /* undefined_column */) {
-      console.warn("[meAndLeagues] member_number column missing — using legacy shape");
+      console.warn("[meAndLeagues] new columns missing — using legacy shape");
       userRow = (await pool.query(
         `SELECT id, email, display_name FROM users WHERE id = $1`, [userId]
       )).rows[0];
@@ -2335,10 +2395,13 @@ async function meAndLeagues(userId) {
   )).rows;
   return {
     user: {
-      id:           Number(userRow.id),
-      email:        userRow.email,
-      displayName:  userRow.display_name,
-      memberNumber: userRow.member_number != null ? Number(userRow.member_number) : null,
+      id:                 Number(userRow.id),
+      email:              userRow.email,
+      displayName:        userRow.display_name,
+      firstName:          userRow.first_name || null,
+      lastName:           userRow.last_name  || null,
+      displayNameCustom:  !!userRow.display_name_customized,
+      memberNumber:       userRow.member_number != null ? Number(userRow.member_number) : null,
     },
     leagues: leagueRows.map(r => ({
       id:        Number(r.id),
@@ -2365,10 +2428,18 @@ app.post("/api/auth/signup", async (req, res) => {
   // leagueCode is now OPTIONAL — by default we create the account only and
   // let the user pick a league from the Clubhouse. Pass leagueCode in only
   // if you want the legacy "join on signup" behavior.
-  const { email, password, displayName, teamId, leagueCode = null } = req.body || {};
+  const body = req.body || {};
+  const { email, password, teamId, leagueCode = null } = body;
+  const firstName = (body.firstName || "").trim();
+  const lastName  = (body.lastName  || "").trim();
+  // Auto-derive displayName from first/last unless the caller sends one.
+  const incomingDisplay = (body.displayName || "").trim();
+  const derivedDisplay  = deriveDisplayName(firstName, lastName);
+  const displayName = incomingDisplay || derivedDisplay;
   if (!isValidEmail(email))            return res.status(400).json({ error: "invalid email" });
   if (!password || password.length < 6) return res.status(400).json({ error: "password must be at least 6 characters" });
-  if (!displayName || !displayName.trim()) return res.status(400).json({ error: "displayName required" });
+  if (!firstName)                       return res.status(400).json({ error: "first name required" });
+  if (!displayName) return res.status(400).json({ error: "displayName required" });
 
   const normalizedEmail = email.trim().toLowerCase();
   const client = await pool.connect();
@@ -2384,10 +2455,14 @@ app.post("/api/auth/signup", async (req, res) => {
     // the league join + slot claim machinery.
     if (!leagueCode) {
       const u = await client.query(
-        `INSERT INTO users (email, password_hash, display_name, member_number)
-         VALUES ($1, $2, $3, (SELECT COALESCE(MAX(member_number), 0) + 1 FROM users))
+        `INSERT INTO users (email, password_hash, display_name, first_name, last_name,
+                            display_name_customized, member_number)
+         VALUES ($1, $2, $3, $4, $5, $6,
+                 (SELECT COALESCE(MAX(member_number), 0) + 1 FROM users))
          RETURNING id, member_number`,
-        [normalizedEmail, hashPassword(password), displayName.trim()]
+        [normalizedEmail, hashPassword(password), displayName.trim(),
+         firstName || null, lastName || null,
+         !!incomingDisplay /* customized only if caller sent one */]
       );
       const userId = Number(u.rows[0].id);
       const token = newSessionToken();
