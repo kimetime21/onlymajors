@@ -127,6 +127,39 @@ async function initSchema() {
         END IF;
       END $$;
     `);
+    // Explicit founder assignment: hardcoded so the original five members of
+    // the Experts league get the numbers everyone remembers, regardless of the
+    // order their accounts happened to be created. Matches case-insensitively
+    // on first_name, falling back to display_name. Wipes #1-5 first so the
+    // UNIQUE constraint can't collide if someone else currently holds those
+    // slots. Idempotent — re-running is a no-op once numbers are in place.
+    try {
+      await pool.query(`UPDATE users SET member_number = NULL WHERE member_number BETWEEN 1 AND 5`);
+      const founders = [
+        ["austin", 1],
+        ["larry",  2],
+        ["boo",    3],
+        ["caleb",  4],
+        ["thorne", 5],
+      ];
+      for (const [name, n] of founders) {
+        await pool.query(`
+          WITH target AS (
+            SELECT id FROM users
+             WHERE LOWER(COALESCE(NULLIF(first_name, ''), NULLIF(split_part(display_name, ' ', 1), ''))) = $1
+               AND member_number IS NULL
+             ORDER BY created_at ASC, id ASC
+             LIMIT 1
+          )
+          UPDATE users SET member_number = $2 FROM target WHERE users.id = target.id
+        `, [name, n]);
+      }
+      console.log("✓  founder member numbers assigned (Austin=1, Larry=2, Boo=3, Caleb=4, Thorne=5)");
+    } catch (err) {
+      console.error("⚠  founder member-number assignment failed:", err.message);
+    }
+    // Backfill any remaining NULL member_numbers in signup order, starting
+    // from MAX+1 (so #1-5 the founders kept above stay untouched).
     await pool.query(`
       WITH ranked AS (
         SELECT id, ROW_NUMBER() OVER (ORDER BY created_at ASC, id ASC) AS rn
@@ -138,6 +171,21 @@ async function initSchema() {
        WHERE users.id = ranked.id
     `);
     console.log("✓  member_number column ensured + backfilled");
+    // Atomic future allocation: back member_number with a Postgres SEQUENCE
+    // seeded just past the current MAX. Signups call nextval() inside their
+    // transaction — collision-proof even under simultaneous signups.
+    try {
+      await pool.query(`CREATE SEQUENCE IF NOT EXISTS member_number_seq START WITH 1`);
+      await pool.query(`
+        SELECT setval('member_number_seq', GREATEST(
+          (SELECT COALESCE(MAX(member_number), 0) FROM users),
+          (SELECT last_value FROM member_number_seq)
+        ))
+      `);
+      console.log("✓  member_number_seq aligned to current MAX");
+    } catch (err) {
+      console.error("⚠  member_number_seq setup failed:", err.message);
+    }
   } catch (err) {
     console.error("⚠  pre-flight member_number migration failed:", err.message);
   }
@@ -2795,8 +2843,7 @@ app.post("/api/auth/signup", async (req, res) => {
       const u = await client.query(
         `INSERT INTO users (email, password_hash, display_name, first_name, last_name,
                             display_name_customized, member_number)
-         VALUES ($1, $2, $3, $4, $5, $6,
-                 (SELECT COALESCE(MAX(member_number), 0) + 1 FROM users))
+         VALUES ($1, $2, $3, $4, $5, $6, nextval('member_number_seq'))
          RETURNING id, member_number`,
         [normalizedEmail, hashPassword(password), displayName.trim(),
          firstName || null, lastName || null,
@@ -2850,12 +2897,11 @@ app.post("/api/auth/signup", async (req, res) => {
       }
       slotRow = slot.rows[0];
     }
-    // Create user — auto-assigns the next sequential membership number
-    // (founder is #1). UNIQUE constraint + this MAX+1 inside the txn means
-    // racing signups can't collide on the same number.
+    // Create user — auto-assigns the next sequential membership number from
+    // member_number_seq. nextval() is atomic so racing signups can't collide.
     const u = await client.query(
       `INSERT INTO users (email, password_hash, display_name, member_number)
-       VALUES ($1, $2, $3, (SELECT COALESCE(MAX(member_number), 0) + 1 FROM users))
+       VALUES ($1, $2, $3, nextval('member_number_seq'))
        RETURNING id, member_number`,
       [normalizedEmail, hashPassword(password), displayName.trim()]
     );
