@@ -256,6 +256,37 @@ async function initSchema() {
 
   // Now add the league_id columns. Existing rows backfill to 1, which is a
   // valid FK target now that league 1 exists.
+  // Defensive standalone migration for member_number — runs as its own query
+  // so it's isolated from anything else that might fail. Idempotent.
+  try {
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS member_number INT`);
+    await pool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'users_member_number_key'
+        ) THEN
+          BEGIN
+            ALTER TABLE users ADD CONSTRAINT users_member_number_key UNIQUE (member_number);
+          EXCEPTION WHEN duplicate_object THEN NULL;
+          END;
+        END IF;
+      END $$;
+    `);
+    await pool.query(`
+      WITH ranked AS (
+        SELECT id, ROW_NUMBER() OVER (ORDER BY created_at ASC, id ASC) AS rn
+          FROM users WHERE member_number IS NULL
+      ),
+      offset_val AS (SELECT COALESCE(MAX(member_number), 0) AS off FROM users)
+      UPDATE users SET member_number = offset_val.off + ranked.rn
+        FROM ranked, offset_val
+       WHERE users.id = ranked.id
+    `);
+    console.log("✓  member_number column ensured + backfilled");
+  } catch (err) {
+    console.error("⚠  member_number migration failed:", err.message);
+  }
+
   await pool.query(`
     ALTER TABLE picks
       ADD COLUMN IF NOT EXISTS league_id BIGINT NOT NULL DEFAULT 1
@@ -1834,9 +1865,23 @@ app.put("/api/profiles/:teamId", requireAuth, async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 // Helper: return current user + their league memberships
 async function meAndLeagues(userId) {
-  const userRow = (await pool.query(
-    `SELECT id, email, display_name, member_number FROM users WHERE id = $1`, [userId]
-  )).rows[0];
+  // Fault-tolerant SELECT — if member_number column hasn't migrated yet on
+  // a given environment, fall back to the legacy shape so auth still works.
+  let userRow;
+  try {
+    userRow = (await pool.query(
+      `SELECT id, email, display_name, member_number FROM users WHERE id = $1`, [userId]
+    )).rows[0];
+  } catch (err) {
+    if (err.code === "42703" /* undefined_column */) {
+      console.warn("[meAndLeagues] member_number column missing — using legacy shape");
+      userRow = (await pool.query(
+        `SELECT id, email, display_name FROM users WHERE id = $1`, [userId]
+      )).rows[0];
+    } else {
+      throw err;
+    }
+  }
   const leagueRows = (await pool.query(
     `SELECT l.id, l.name, l.invite_code, l.format, l.scope, l.major_id,
             lm.team_id, lm.team_name, lm.team_color, lm.role
