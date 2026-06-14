@@ -163,16 +163,18 @@ async function initSchema() {
     );
 
     -- Idempotency log. We never want to spam the same person about the
-    -- same event twice. The composite unique constraint is the safety net.
+    -- same event twice. The composite unique INDEX (not constraint — we
+    -- need COALESCE so NULL rounds collapse to 0) is the safety net.
     CREATE TABLE IF NOT EXISTS notification_log (
       user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       kind       TEXT   NOT NULL,  -- 'picks_open' | 'wed_reminder' | 'round_wrap' | 'mc_alert' | 'sat_reminder'
       major_id   TEXT   NOT NULL,
       round      INT,              -- for round_wrap; null otherwise
       sent_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      message_id TEXT,             -- Resend message id, for traceability
-      UNIQUE (user_id, kind, major_id, COALESCE(round, 0))
+      message_id TEXT              -- Resend message id, for traceability
     );
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_log_uniq
+      ON notification_log (user_id, kind, major_id, COALESCE(round, 0));
     CREATE INDEX IF NOT EXISTS idx_notification_log_user ON notification_log (user_id);
 
     CREATE TABLE IF NOT EXISTS picks (
