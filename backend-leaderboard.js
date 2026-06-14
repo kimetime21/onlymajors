@@ -97,8 +97,28 @@ async function initSchema() {
       email         TEXT UNIQUE NOT NULL,
       password_hash TEXT NOT NULL,
       display_name  TEXT,
+      member_number INT UNIQUE,
       created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS member_number INT;
+    DO $$ BEGIN
+      IF NOT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = 'users_member_number_key') THEN
+        BEGIN
+          ALTER TABLE users ADD CONSTRAINT users_member_number_key UNIQUE (member_number);
+        EXCEPTION WHEN duplicate_object THEN NULL;
+        END;
+      END IF;
+    END $$;
+    -- Backfill: assign #1, #2, #3 ... ordered by signup time so the founder
+    -- of the platform gets #1. Idempotent — only fills NULL rows.
+    WITH ranked AS (
+      SELECT id, ROW_NUMBER() OVER (ORDER BY created_at ASC, id ASC) AS rn
+        FROM users WHERE member_number IS NULL
+    )
+    UPDATE users SET member_number = (
+      SELECT COALESCE(MAX(member_number), 0) FROM users
+    ) + ranked.rn
+    FROM ranked WHERE users.id = ranked.id;
 
     CREATE TABLE IF NOT EXISTS league_members (
       id          BIGSERIAL PRIMARY KEY,
@@ -128,6 +148,32 @@ async function initSchema() {
       created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_password_resets_user ON password_resets (user_id);
+
+    -- Per-user notification toggles. All default to TRUE so a user opts OUT,
+    -- not in. Row is created lazily on first read; absence means "all on".
+    CREATE TABLE IF NOT EXISTS notification_prefs (
+      user_id        BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      picks_open     BOOLEAN NOT NULL DEFAULT true,
+      wed_reminder   BOOLEAN NOT NULL DEFAULT true,
+      round_wrap     BOOLEAN NOT NULL DEFAULT true,
+      mc_alert       BOOLEAN NOT NULL DEFAULT true,
+      sat_reminder   BOOLEAN NOT NULL DEFAULT true,
+      unsub_token    TEXT NOT NULL DEFAULT encode(gen_random_bytes(16), 'hex'),
+      updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+
+    -- Idempotency log. We never want to spam the same person about the
+    -- same event twice. The composite unique constraint is the safety net.
+    CREATE TABLE IF NOT EXISTS notification_log (
+      user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      kind       TEXT   NOT NULL,  -- 'picks_open' | 'wed_reminder' | 'round_wrap' | 'mc_alert' | 'sat_reminder'
+      major_id   TEXT   NOT NULL,
+      round      INT,              -- for round_wrap; null otherwise
+      sent_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      message_id TEXT,             -- Resend message id, for traceability
+      UNIQUE (user_id, kind, major_id, COALESCE(round, 0))
+    );
+    CREATE INDEX IF NOT EXISTS idx_notification_log_user ON notification_log (user_id);
 
     CREATE TABLE IF NOT EXISTS picks (
       team_id    TEXT NOT NULL,
@@ -645,6 +691,174 @@ async function sendEmail({ to, subject, html, text, replyTo, tag }) {
   console.log(`[email] sent "${subject}" → ${to} (id=${body.id})`);
   return { id: body.id };
 }
+
+// ───────── Major metadata (for notification scheduling) ───────────────────
+// Mirrors the front-end MAJORS constant — only the fields a notification
+// needs (dates, course, label). Kept in code rather than a DB table because
+// the calendar barely changes; bump these once a year.
+const MAJORS_META = {
+  masters: { name: "The Masters",          short: "Masters",   course: "Augusta National GC", city: "Augusta, GA",        picksOpenDate: "2026-04-06", firstTeeTime: "2026-04-09T07:50-04:00", lastFinish: "2026-04-12T20:00-04:00", teeTimeLabel: "Apr 9, 7:50 AM ET" },
+  pga:     { name: "PGA Championship",     short: "PGA",       course: "Aronimink GC",        city: "Newtown Square, PA", picksOpenDate: "2026-05-11", firstTeeTime: "2026-05-14T07:00-04:00", lastFinish: "2026-05-17T20:00-04:00", teeTimeLabel: "May 14, 7:00 AM ET" },
+  usopen:  { name: "U.S. Open",            short: "U.S. Open", course: "Shinnecock Hills",    city: "Southampton, NY",    picksOpenDate: "2026-06-15", firstTeeTime: "2026-06-18T06:45-04:00", lastFinish: "2026-06-21T20:00-04:00", teeTimeLabel: "Jun 18, 6:45 AM ET" },
+  open:    { name: "The Open Championship", short: "The Open", course: "Royal Birkdale",      city: "Southport, England", picksOpenDate: "2026-07-13", firstTeeTime: "2026-07-16T06:35+01:00", lastFinish: "2026-07-19T20:00+01:00", teeTimeLabel: "Jul 16, 6:35 AM BST" },
+};
+function majorStatus(majorId, now = new Date()) {
+  const m = MAJORS_META[majorId];
+  if (!m) return null;
+  const start = new Date(m.firstTeeTime).getTime();
+  const end   = new Date(m.lastFinish).getTime() + 60 * 60 * 1000;
+  const t = now.getTime();
+  if (t < start) return "upcoming";
+  if (t < end)   return "live";
+  return "complete";
+}
+
+// ───────── Notification helpers ───────────────────────────────────────────
+// One source of truth for: "should this user be notified about this event,
+// and have we already done it?" Every notification trigger calls these.
+const NOTIFICATION_KINDS = ["picks_open", "wed_reminder", "round_wrap", "mc_alert", "sat_reminder"];
+
+async function getOrCreatePrefs(userId) {
+  const { rows } = await pool.query(
+    `INSERT INTO notification_prefs (user_id) VALUES ($1)
+     ON CONFLICT (user_id) DO UPDATE SET user_id = EXCLUDED.user_id
+     RETURNING *`,
+    [userId]
+  );
+  return rows[0];
+}
+
+// Atomic: insert a row in notification_log if we haven't already sent this
+// exact notification. Returns true if INSERTED (caller should send the email);
+// false if a row already exists (caller skips, no spam).
+async function reserveNotification({ userId, kind, majorId, round = null, messageId = null }) {
+  try {
+    await pool.query(
+      `INSERT INTO notification_log (user_id, kind, major_id, round, message_id)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [userId, kind, majorId, round, messageId]
+    );
+    return true;
+  } catch (err) {
+    if (err.code === "23505") return false; // unique_violation = already sent
+    throw err;
+  }
+}
+
+// ───────── Picks Open notification ────────────────────────────────────────
+// Fires once per (user, major) when:
+//   - calendar has passed the major's picksOpenDate
+//   - major is still upcoming (not started yet)
+//   - user belongs to at least one league that includes this major
+//   - user's picks_open preference is true
+// Idempotency is guaranteed by the UNIQUE constraint on notification_log.
+async function sendPicksOpenEmail(user, major) {
+  const ctaUrl = `${FRONTEND_URL}/?utm_source=email&utm_campaign=picks_open&utm_content=${major.id}`;
+  const layoutArgs = {
+    preheader:  `Picks for ${major.name} are open — make yours.`,
+    heading:    `Picks open: ${major.short}`,
+    intro:      `The field is set for <strong>${major.name}</strong> at ${major.course}. Lock in your four starters and two bench before first tee on ${major.teeTimeLabel}.`,
+    ctaLabel:   "Make your picks",
+    ctaUrl,
+    bodyHtml: `
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:8px 0 0;background:${BRAND.creamSoft};border:1px solid ${BRAND.rule};border-radius:8px;">
+        <tr>
+          <td style="padding:14px 16px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+            <div style="color:${BRAND.dim};font-size:10px;text-transform:uppercase;letter-spacing:0.18em;font-weight:600;">Course</div>
+            <div style="color:${BRAND.ink};font-size:14px;font-weight:600;margin-top:2px;">${major.course} · ${major.city}</div>
+            <div style="color:${BRAND.dim};font-size:10px;text-transform:uppercase;letter-spacing:0.18em;font-weight:600;margin-top:10px;">First tee</div>
+            <div style="color:${BRAND.ink};font-size:14px;font-weight:600;margin-top:2px;">${major.teeTimeLabel}</div>
+          </td>
+        </tr>
+      </table>`,
+    footerNote: "You're receiving this because Picks Open notifications are on. Manage in Settings.",
+  };
+  return sendEmail({
+    to:      user.email,
+    subject: `Picks open: ${major.name}`,
+    tag:     "picks-open",
+    html:    emailHtml(layoutArgs),
+    text:    emailText({ ...layoutArgs, bodyText: `Course: ${major.course} · ${major.city}\nFirst tee: ${major.teeTimeLabel}` }),
+  });
+}
+
+async function checkPicksOpenForMajor(majorId) {
+  if (!pool || !EMAIL_ENABLED) return { skipped: true };
+  const meta = MAJORS_META[majorId];
+  if (!meta) return { skipped: true, reason: "unknown major" };
+  // Calendar gate
+  const now = new Date();
+  if (new Date(meta.picksOpenDate) > now) return { skipped: true, reason: "picks not yet open" };
+  if (majorStatus(majorId, now) !== "upcoming") return { skipped: true, reason: "major no longer upcoming" };
+
+  // Recipients: every distinct user in any league that includes this major,
+  // who has picks_open prefs on (or no row yet — defaults to on), and who
+  // hasn't already been notified for this major.
+  const { rows: recipients } = await pool.query(
+    `SELECT DISTINCT u.id, u.email, u.display_name
+       FROM users u
+       JOIN league_members lm ON lm.user_id = u.id
+       JOIN leagues l         ON l.id = lm.league_id
+      LEFT JOIN notification_prefs np ON np.user_id = u.id
+      LEFT JOIN notification_log nl
+             ON nl.user_id = u.id AND nl.kind = 'picks_open' AND nl.major_id = $1
+      WHERE COALESCE(np.picks_open, true) = true
+        AND nl.user_id IS NULL
+        AND u.email IS NOT NULL
+        AND (l.included_majors IS NULL OR $1 = ANY(l.included_majors))`,
+    [majorId]
+  );
+
+  const results = { sent: 0, failed: 0, total: recipients.length };
+  for (const u of recipients) {
+    const reserved = await reserveNotification({ userId: u.id, kind: "picks_open", majorId });
+    if (!reserved) continue;
+    try {
+      const { id } = await sendPicksOpenEmail({ email: u.email, displayName: u.display_name }, { id: majorId, ...meta });
+      if (id) {
+        await pool.query(
+          `UPDATE notification_log SET message_id = $1
+            WHERE user_id = $2 AND kind = 'picks_open' AND major_id = $3 AND round IS NULL`,
+          [id, u.id, majorId]
+        );
+      }
+      results.sent++;
+    } catch (err) {
+      console.error(`[picks_open] failed for user ${u.id}:`, err.message);
+      // Roll back the reservation so we retry next pass.
+      await pool.query(
+        `DELETE FROM notification_log
+          WHERE user_id = $1 AND kind = 'picks_open' AND major_id = $2 AND round IS NULL AND message_id IS NULL`,
+        [u.id, majorId]
+      );
+      results.failed++;
+    }
+  }
+  if (results.total > 0) {
+    console.log(`[picks_open] ${majorId}: sent=${results.sent} failed=${results.failed} total=${results.total}`);
+  }
+  return results;
+}
+
+async function runNotificationSweep() {
+  if (!pool || !EMAIL_ENABLED) return;
+  try {
+    for (const majorId of Object.keys(MAJORS_META)) {
+      await checkPicksOpenForMajor(majorId);
+    }
+  } catch (err) {
+    console.error("[notifications] sweep failed:", err);
+  }
+}
+
+// Admin endpoint to fire the sweep on demand (useful for testing).
+app.post("/api/admin/notifications/sweep", requireAuth, async (req, res) => {
+  const results = {};
+  for (const majorId of Object.keys(MAJORS_META)) {
+    results[majorId] = await checkPicksOpenForMajor(majorId);
+  }
+  res.json({ ok: true, results });
+});
 
 // Admin-only test endpoint to verify the email pipeline end-to-end.
 // Call from any logged-in browser via the dev console or curl:
@@ -1619,7 +1833,7 @@ app.put("/api/profiles/:teamId", requireAuth, async (req, res) => {
 // Helper: return current user + their league memberships
 async function meAndLeagues(userId) {
   const userRow = (await pool.query(
-    `SELECT id, email, display_name FROM users WHERE id = $1`, [userId]
+    `SELECT id, email, display_name, member_number FROM users WHERE id = $1`, [userId]
   )).rows[0];
   const leagueRows = (await pool.query(
     `SELECT l.id, l.name, l.invite_code, l.format, l.scope, l.major_id,
@@ -1632,9 +1846,10 @@ async function meAndLeagues(userId) {
   )).rows;
   return {
     user: {
-      id:          Number(userRow.id),
-      email:       userRow.email,
-      displayName: userRow.display_name,
+      id:           Number(userRow.id),
+      email:        userRow.email,
+      displayName:  userRow.display_name,
+      memberNumber: userRow.member_number != null ? Number(userRow.member_number) : null,
     },
     leagues: leagueRows.map(r => ({
       id:        Number(r.id),
@@ -1711,10 +1926,13 @@ app.post("/api/auth/signup", async (req, res) => {
       }
       slotRow = slot.rows[0];
     }
-    // Create user.
+    // Create user — auto-assigns the next sequential membership number
+    // (founder is #1). UNIQUE constraint + this MAX+1 inside the txn means
+    // racing signups can't collide on the same number.
     const u = await client.query(
-      `INSERT INTO users (email, password_hash, display_name)
-       VALUES ($1, $2, $3) RETURNING id`,
+      `INSERT INTO users (email, password_hash, display_name, member_number)
+       VALUES ($1, $2, $3, (SELECT COALESCE(MAX(member_number), 0) + 1 FROM users))
+       RETURNING id, member_number`,
       [normalizedEmail, hashPassword(password), displayName.trim()]
     );
     const userId = Number(u.rows[0].id);
@@ -2558,7 +2776,14 @@ app.get("/api/me/leagues-summary", requireAuth, async (req, res) => {
         scorePrediction: p.score_prediction == null ? null : Number(p.score_prediction),
       };
     }
+    // Fetch the caller's membership number for the membership-card UI.
+    const meRow = (await pool.query(
+      `SELECT member_number FROM users WHERE id = $1`, [userId]
+    )).rows[0];
     res.json({
+      me: {
+        memberNumber: meRow?.member_number != null ? Number(meRow.member_number) : null,
+      },
       leagues: leagueRows.map(r => ({
         league: {
           id:             Number(r.id),
@@ -2608,4 +2833,9 @@ app.listen(PORT, async () => {
   // Wait for the schema to be ready, then rehydrate snapshots from DB.
   // initSchema started at boot; this just gives it a moment if it's racing.
   setTimeout(() => loadSnapshotsFromDB(), 1000);
+  // Notification sweep — runs once 30s after boot (so initSchema has settled)
+  // and then every 6 hours. Picks Open fires the first time a major's
+  // picksOpenDate is past; idempotent via notification_log.
+  setTimeout(() => { runNotificationSweep(); }, 30_000);
+  setInterval(()  => { runNotificationSweep(); }, 6 * 60 * 60_000);
 });
