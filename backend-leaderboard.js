@@ -3724,18 +3724,28 @@ app.get("/api/me/leagues-summary", requireAuth, async (req, res) => {
         scorePrediction: p.score_prediction == null ? null : Number(p.score_prediction),
       };
     }
-    // Fetch the caller's membership number for the membership-card UI.
-    // Fault-tolerant: if member_number column hasn't been added yet on a
-    // given environment, fall back to null so the whole endpoint doesn't 500.
-    let memberNumber = null;
+    // Fetch the caller's membership number + name fields for the
+    // membership-card UI. Fault-tolerant: if any of the newer columns
+    // haven't migrated yet on a given environment, fall back to null so
+    // the whole endpoint doesn't 500.
+    let memberNumber = null, firstName = null, lastName = null, displayNameCustom = false;
     try {
       const meRow = (await pool.query(
-        `SELECT member_number FROM users WHERE id = $1`, [userId]
+        `SELECT member_number, first_name, last_name, display_name_customized
+           FROM users WHERE id = $1`, [userId]
       )).rows[0];
-      memberNumber = meRow?.member_number != null ? Number(meRow.member_number) : null;
+      memberNumber       = meRow?.member_number != null ? Number(meRow.member_number) : null;
+      firstName          = meRow?.first_name || null;
+      lastName           = meRow?.last_name  || null;
+      displayNameCustom  = !!meRow?.display_name_customized;
     } catch (e) {
       if (e.code === "42703") {
-        console.warn("[leagues-summary] member_number column missing — returning null");
+        console.warn("[leagues-summary] new user columns missing — returning legacy shape");
+        // Fall back to just member_number on its own.
+        try {
+          const meRow = (await pool.query(`SELECT member_number FROM users WHERE id = $1`, [userId])).rows[0];
+          memberNumber = meRow?.member_number != null ? Number(meRow.member_number) : null;
+        } catch (_) {}
       } else {
         throw e;
       }
@@ -3743,6 +3753,9 @@ app.get("/api/me/leagues-summary", requireAuth, async (req, res) => {
     res.json({
       me: {
         memberNumber,
+        firstName,
+        lastName,
+        displayNameCustom,
       },
       leagues: leagueRows.map(r => ({
         league: {
