@@ -239,6 +239,53 @@ async function initSchema() {
       ON notification_log (user_id, kind, major_id, COALESCE(round, 0));
     CREATE INDEX IF NOT EXISTS idx_notification_log_user ON notification_log (user_id);
 
+    -- ─── Club Championship: platform-wide single-major contest ───────────
+    -- Entries (one row per user per major). Roster is 4 starters + 2 bench
+    -- to match every other league. Submitted_at powers the "earliest entry
+    -- wins ties" tiebreaker (after total + score prediction).
+    CREATE TABLE IF NOT EXISTS club_championship_entries (
+      user_id           BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      major_id          TEXT   NOT NULL,
+      year              INT    NOT NULL,
+      starters          JSONB  NOT NULL DEFAULT '[]'::jsonb,
+      bench             JSONB  NOT NULL DEFAULT '[]'::jsonb,
+      subs              JSONB  NOT NULL DEFAULT '[]'::jsonb,
+      score_prediction  INT,
+      submitted_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_id, major_id, year)
+    );
+    CREATE INDEX IF NOT EXISTS idx_cc_entries_major
+      ON club_championship_entries (major_id, year);
+
+    -- Per-major running results — refreshed on a cadence as the tournament
+    -- plays out. Rank is computed at refresh time.
+    CREATE TABLE IF NOT EXISTS club_championship_results (
+      user_id      BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      major_id     TEXT   NOT NULL,
+      year         INT    NOT NULL,
+      total        NUMERIC NOT NULL DEFAULT 0,
+      rank         INT,
+      updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (user_id, major_id, year)
+    );
+    CREATE INDEX IF NOT EXISTS idx_cc_results_major
+      ON club_championship_results (major_id, year, rank);
+
+    -- Hall of Fame — finalized winner per (major, year). One row added
+    -- when each contest closes. Champion name snapshotted so an account
+    -- rename doesn't break the archive.
+    CREATE TABLE IF NOT EXISTS club_championship_archive (
+      major_id          TEXT NOT NULL,
+      year              INT  NOT NULL,
+      champion_user_id  BIGINT REFERENCES users(id) ON DELETE SET NULL,
+      champion_name     TEXT NOT NULL,
+      champion_total    NUMERIC NOT NULL,
+      runners_up        JSONB DEFAULT '[]'::jsonb,
+      finalized_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (major_id, year)
+    );
+
     CREATE TABLE IF NOT EXISTS picks (
       team_id    TEXT NOT NULL,
       major_id   TEXT NOT NULL,
@@ -1150,24 +1197,45 @@ async function checkRoundWrapForMajor(majorId) {
 // contest backend hasn't been built yet, or anything errors.
 async function buildClubChampBlock(userId, majorId, round) {
   try {
-    // Schema/data for the Club Championship isn't live yet — bail until
-    // the enrollment + scoring tables (task #153) are wired up. When that
-    // ships, this query is what we'll uncomment:
-    //
-    //   const { rows } = await pool.query(`
-    //     SELECT cce.starters, cce.score_prediction, ccr.total, ccr.rank,
-    //            (SELECT COUNT(*) FROM club_championship_entries WHERE major_id = $2) AS field_size
-    //       FROM club_championship_entries cce
-    //       LEFT JOIN club_championship_results ccr
-    //              ON ccr.user_id = cce.user_id AND ccr.major_id = cce.major_id
-    //      WHERE cce.user_id = $1 AND cce.major_id = $2`,
-    //     [userId, majorId]);
-    //   if (!rows.length) return "";
-    //   const entry = rows[0];
-    //   …build the HTML block…
-    //
-    // For now: feature flag off.
-    return "";
+    const year = ccYear(majorId);
+    const { rows } = await pool.query(`
+      SELECT cce.starters, ccr.total, ccr.rank,
+             (SELECT COUNT(*) FROM club_championship_entries
+               WHERE major_id = $2 AND year = $3) AS field_size
+        FROM club_championship_entries cce
+        LEFT JOIN club_championship_results ccr
+               ON ccr.user_id = cce.user_id AND ccr.major_id = cce.major_id AND ccr.year = cce.year
+       WHERE cce.user_id = $1 AND cce.major_id = $2 AND cce.year = $3`,
+      [userId, majorId, year]);
+    if (!rows.length) return "";
+    const e = rows[0];
+    // Hydrate the roster line items with current earnings from SNAPSHOTS.
+    // Each "starter" is a curated golfer id; map to name + total for display.
+    const starters = Array.isArray(e.starters) ? e.starters : [];
+    const roster = starters.map((gid) => {
+      const name = (typeof GID_TO_NAME !== "undefined" && GID_TO_NAME?.get?.(gid))
+        || (Array.isArray(FRONTEND_GOLFER_IDS)
+              ? (FRONTEND_GOLFER_IDS.find(([id]) => id === gid)?.[1] || gid)
+              : gid);
+      // Per-golfer earnings: sum across all rounds in SNAPSHOTS.
+      let total = 0;
+      const dgIdEntry = (typeof GID_TO_DGID !== "undefined" && GID_TO_DGID?.get?.(gid));
+      const snap = SNAPSHOTS[majorId] || {};
+      const golferSnaps = dgIdEntry != null ? (snap[dgIdEntry] || {}) : {};
+      for (const r of [1, 2, 3, 4]) {
+        const s = golferSnaps[r];
+        const m = s?.finalMoney ?? s?.projMoney;
+        if (typeof m === "number") total = m; // each round's snap is cumulative
+      }
+      return { name, total };
+    });
+    return renderClubChampBlock({
+      rank:      e.rank == null ? null : Number(e.rank),
+      fieldSize: Number(e.field_size || 0),
+      total:     Number(e.total || 0),
+      roster,
+      round,
+    });
   } catch (err) {
     console.error("[club_champ_block] failed for user", userId, err.message);
     return "";
@@ -1369,6 +1437,159 @@ app.post("/api/admin/notifications/sweep", requireAuth, async (req, res) => {
     };
   }
   res.json({ ok: true, results });
+});
+
+// ─── Club Championship endpoints ──────────────────────────────────────────
+// GET  /api/club-championship/picks/:majorId    — caller's roster for a major
+// PUT  /api/club-championship/picks/:majorId    — upsert caller's roster
+// GET  /api/club-championship/standings/:majorId — top 10 + caller pinned
+// GET  /api/club-championship/archive           — Hall of Fame
+// All scoped to the current calendar year of the focus major.
+function ccYear(majorId) {
+  const meta = MAJORS_META[majorId];
+  if (meta?.firstTeeTime) return new Date(meta.firstTeeTime).getFullYear();
+  return new Date().getFullYear();
+}
+
+app.get("/api/club-championship/picks/:majorId", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  const { majorId } = req.params;
+  if (!MAJORS_META[majorId]) return res.status(404).json({ error: `unknown major: ${majorId}` });
+  try {
+    const year = ccYear(majorId);
+    const { rows } = await pool.query(
+      `SELECT starters, bench, subs, score_prediction, submitted_at
+         FROM club_championship_entries
+        WHERE user_id = $1 AND major_id = $2 AND year = $3`,
+      [req.user.id, majorId, year]
+    );
+    if (!rows.length) return res.json({ majorId, year, enrolled: false });
+    const r = rows[0];
+    res.json({
+      majorId, year, enrolled: true,
+      starters:        r.starters || [],
+      bench:           r.bench || [],
+      subs:            r.subs || [],
+      scorePrediction: r.score_prediction,
+      submittedAt:     r.submitted_at,
+    });
+  } catch (err) {
+    console.error("[GET cc picks] failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/club-championship/picks/:majorId", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  const { majorId } = req.params;
+  if (!MAJORS_META[majorId]) return res.status(404).json({ error: `unknown major: ${majorId}` });
+  const { starters = [], bench = [], subs = [], scorePrediction = null } = req.body || {};
+  // Validation: roster shape matches league play (4 + 2).
+  if (!Array.isArray(starters) || starters.length > 4) {
+    return res.status(400).json({ error: "starters must be an array of up to 4 golfers" });
+  }
+  if (!Array.isArray(bench) || bench.length > 2) {
+    return res.status(400).json({ error: "bench must be an array of up to 2 golfers" });
+  }
+  const sp = scorePrediction == null ? null : Math.max(-20, Math.min(10, Math.round(Number(scorePrediction))));
+  try {
+    // Lock once submission is closed (after first tee of the major).
+    const meta = MAJORS_META[majorId];
+    if (meta?.firstTeeTime && new Date(meta.firstTeeTime) <= new Date()) {
+      return res.status(409).json({ error: "entries closed at first tee" });
+    }
+    const year = ccYear(majorId);
+    await pool.query(
+      `INSERT INTO club_championship_entries
+         (user_id, major_id, year, starters, bench, subs, score_prediction, submitted_at, updated_at)
+       VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, NOW(), NOW())
+       ON CONFLICT (user_id, major_id, year)
+       DO UPDATE SET starters = EXCLUDED.starters,
+                     bench    = EXCLUDED.bench,
+                     subs     = EXCLUDED.subs,
+                     score_prediction = EXCLUDED.score_prediction,
+                     updated_at = NOW()
+                     -- submitted_at intentionally NOT updated — it anchors
+                     -- the "earliest entry" tiebreaker forever.`,
+      [req.user.id, majorId, year, JSON.stringify(starters), JSON.stringify(bench), JSON.stringify(subs), sp]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[PUT cc picks] failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/club-championship/standings/:majorId", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  const { majorId } = req.params;
+  if (!MAJORS_META[majorId]) return res.status(404).json({ error: `unknown major: ${majorId}` });
+  try {
+    const year = ccYear(majorId);
+    // Top 10 with display info from users.
+    const { rows: top10 } = await pool.query(
+      `SELECT r.user_id, u.display_name, r.total, r.rank
+         FROM club_championship_results r
+         JOIN users u ON u.id = r.user_id
+        WHERE r.major_id = $1 AND r.year = $2
+        ORDER BY r.rank ASC NULLS LAST
+        LIMIT 10`,
+      [majorId, year]
+    );
+    // Caller's own row + field size.
+    const { rows: mine } = await pool.query(
+      `SELECT r.total, r.rank
+         FROM club_championship_results r
+        WHERE r.user_id = $1 AND r.major_id = $2 AND r.year = $3`,
+      [req.user.id, majorId, year]
+    );
+    const { rows: countRows } = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM club_championship_entries WHERE major_id = $1 AND year = $2`,
+      [majorId, year]
+    );
+    res.json({
+      majorId, year,
+      fieldSize: countRows[0]?.n || 0,
+      top10: top10.map(r => ({
+        userId: Number(r.user_id),
+        name:   r.display_name || `Member ${r.user_id}`,
+        total:  Number(r.total),
+        rank:   r.rank == null ? null : Number(r.rank),
+      })),
+      you: mine.length ? {
+        total: Number(mine[0].total),
+        rank:  mine[0].rank == null ? null : Number(mine[0].rank),
+      } : null,
+    });
+  } catch (err) {
+    console.error("[GET cc standings] failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/api/club-championship/archive", async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const { rows } = await pool.query(
+      `SELECT major_id, year, champion_user_id, champion_name, champion_total, runners_up, finalized_at
+         FROM club_championship_archive
+        ORDER BY year DESC, finalized_at DESC`
+    );
+    res.json({
+      majors: rows.map(r => ({
+        majorId:        r.major_id,
+        year:           r.year,
+        championUserId: r.champion_user_id == null ? null : Number(r.champion_user_id),
+        championName:   r.champion_name,
+        championTotal:  Number(r.champion_total),
+        runnersUp:      r.runners_up || [],
+        finalizedAt:    r.finalized_at,
+      })),
+    });
+  } catch (err) {
+    console.error("[GET cc archive] failed:", err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ── /api/me/notifications ─────────────────────────────────────────────────
@@ -2099,6 +2320,56 @@ app.get("/api/backfill/:majorId", async (req, res) => {
 // sources (in-play if the major is live, /field-updates if DataGolf has the
 // major queued as the next event, snapshots otherwise) and returns rich
 // player rows the frontend can render even if the player isn't in GOLFERS.
+// /api/tee-times/:majorId/:round — surfaces tee times for a specific round
+// of a major from DataGolf's /field-updates endpoint. Returns a map of
+// golfer-id → ISO datetime + a short friendly label ("8:42 AM ET"). Used
+// by the Picks tab to show the next-round tee time next to each starter
+// once the previous round wraps. Cached 5 minutes — tee times rarely shift.
+app.get("/api/tee-times/:majorId/:round", async (req, res) => {
+  const { majorId } = req.params;
+  const round = parseInt(req.params.round, 10);
+  const eventId = DG_EVENT_IDS[majorId];
+  if (!eventId) return res.status(404).json({ error: `unknown major: ${majorId}` });
+  if (!round || round < 1 || round > 4) {
+    return res.status(400).json({ error: "round must be 1-4" });
+  }
+  try {
+    const cacheKey = `tee:${majorId}:r${round}`;
+    const data = await cached(cacheKey, 5 * 60_000, () =>
+      fetchDG("/field-updates", { tour: "pga" }).catch(() => null)
+    );
+    if (!data || Number(data.event_id ?? data.eventId) !== Number(eventId)) {
+      return res.json({ majorId, round, times: {}, source: "no-field-data" });
+    }
+    const field = Array.isArray(data.field) ? data.field : [];
+    // Field rows usually have shape: { dg_id, player_name, r1_teetime, r2_teetime, r3_teetime, r4_teetime, course? }.
+    // Falls back to teetime if round-specific isn't set (Thu R1 case).
+    const teeKey = `r${round}_teetime`;
+    const times = {};
+    for (const p of field) {
+      const iso = p[teeKey] || (round === 1 ? p.teetime : null);
+      if (!iso) continue;
+      const gid = matchGolferId(p.player_name) || `dg-${p.dg_id || NORMALIZE(p.player_name)}`;
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) continue;
+      // Pretty label in ET: "8:42 AM ET" / "12:05 PM ET".
+      const label = d.toLocaleTimeString("en-US", {
+        timeZone: "America/New_York", hour: "numeric", minute: "2-digit"
+      }) + " ET";
+      times[gid] = { iso, label };
+    }
+    res.json({
+      majorId, round,
+      eventName:  data.event_name || null,
+      lastUpdated: data.last_updated || null,
+      times,
+    });
+  } catch (err) {
+    console.error("[tee-times] failed:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/api/field/:majorId", async (req, res) => {
   const majorId = req.params.majorId;
   const eventId = DG_EVENT_IDS[majorId];
