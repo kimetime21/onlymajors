@@ -771,10 +771,18 @@ async function sendEmail({ to, subject, html, text, replyTo, tag }) {
 // needs (dates, course, label). Kept in code rather than a DB table because
 // the calendar barely changes; bump these once a year.
 const MAJORS_META = {
-  masters: { name: "The Masters",          short: "Masters",   course: "Augusta National GC", city: "Augusta, GA",        picksOpenDate: "2026-04-06", firstTeeTime: "2026-04-09T07:50-04:00", lastFinish: "2026-04-12T20:00-04:00", teeTimeLabel: "Apr 9, 7:50 AM ET" },
-  pga:     { name: "PGA Championship",     short: "PGA",       course: "Aronimink GC",        city: "Newtown Square, PA", picksOpenDate: "2026-05-11", firstTeeTime: "2026-05-14T07:00-04:00", lastFinish: "2026-05-17T20:00-04:00", teeTimeLabel: "May 14, 7:00 AM ET" },
-  usopen:  { name: "U.S. Open",            short: "U.S. Open", course: "Shinnecock Hills",    city: "Southampton, NY",    picksOpenDate: "2026-06-15", firstTeeTime: "2026-06-18T06:45-04:00", lastFinish: "2026-06-21T20:00-04:00", teeTimeLabel: "Jun 18, 6:45 AM ET" },
-  open:    { name: "The Open Championship", short: "The Open", course: "Royal Birkdale",      city: "Southport, England", picksOpenDate: "2026-07-13", firstTeeTime: "2026-07-16T06:35+01:00", lastFinish: "2026-07-19T20:00+01:00", teeTimeLabel: "Jul 16, 6:35 AM BST" },
+  masters: { name: "The Masters",          short: "Masters",   course: "Augusta National GC", city: "Augusta, GA",        picksOpenDate: "2026-04-06", firstTeeTime: "2026-04-09T07:50-04:00", lastFinish: "2026-04-12T20:00-04:00", teeTimeLabel: "Apr 9, 7:50 AM ET",
+             rounds: { r1: "2026-04-09T07:50-04:00", r2: "2026-04-10T07:50-04:00", r3: "2026-04-11T09:00-04:00", r4: "2026-04-12T09:30-04:00" },
+             roundEnds: { r1: "2026-04-09T20:00-04:00", r2: "2026-04-10T20:00-04:00", r3: "2026-04-11T20:00-04:00", r4: "2026-04-12T20:00-04:00" } },
+  pga:     { name: "PGA Championship",     short: "PGA",       course: "Aronimink GC",        city: "Newtown Square, PA", picksOpenDate: "2026-05-11", firstTeeTime: "2026-05-14T07:00-04:00", lastFinish: "2026-05-17T20:00-04:00", teeTimeLabel: "May 14, 7:00 AM ET",
+             rounds: { r1: "2026-05-14T07:00-04:00", r2: "2026-05-15T07:00-04:00", r3: "2026-05-16T09:00-04:00", r4: "2026-05-17T09:30-04:00" },
+             roundEnds: { r1: "2026-05-14T20:00-04:00", r2: "2026-05-15T20:00-04:00", r3: "2026-05-16T20:00-04:00", r4: "2026-05-17T20:00-04:00" } },
+  usopen:  { name: "U.S. Open",            short: "U.S. Open", course: "Shinnecock Hills",    city: "Southampton, NY",    picksOpenDate: "2026-06-15", firstTeeTime: "2026-06-18T06:45-04:00", lastFinish: "2026-06-21T20:00-04:00", teeTimeLabel: "Jun 18, 6:45 AM ET",
+             rounds: { r1: "2026-06-18T06:45-04:00", r2: "2026-06-19T06:45-04:00", r3: "2026-06-20T09:00-04:00", r4: "2026-06-21T09:30-04:00" },
+             roundEnds: { r1: "2026-06-18T20:00-04:00", r2: "2026-06-19T20:00-04:00", r3: "2026-06-20T20:00-04:00", r4: "2026-06-21T20:00-04:00" } },
+  open:    { name: "The Open Championship", short: "The Open", course: "Royal Birkdale",      city: "Southport, England", picksOpenDate: "2026-07-13", firstTeeTime: "2026-07-16T06:35+01:00", lastFinish: "2026-07-19T20:00+01:00", teeTimeLabel: "Jul 16, 6:35 AM BST",
+             rounds: { r1: "2026-07-16T06:35+01:00", r2: "2026-07-17T06:35+01:00", r3: "2026-07-18T08:30+01:00", r4: "2026-07-19T09:30+01:00" },
+             roundEnds: { r1: "2026-07-16T20:00+01:00", r2: "2026-07-17T20:00+01:00", r3: "2026-07-18T20:00+01:00", r4: "2026-07-19T20:00+01:00" } },
 };
 function majorStatus(majorId, now = new Date()) {
   const m = MAJORS_META[majorId];
@@ -914,11 +922,347 @@ async function checkPicksOpenForMajor(majorId) {
   return results;
 }
 
+// ───────── Wednesday picks-close reminder ─────────────────────────────────
+// Fires Wednesday evening (tournament-local) to users who haven't completed
+// their roster for an upcoming major. "Complete" = 4 starters + 2 bench.
+async function sendWedReminderEmail(user, major, missingPieces) {
+  const ctaUrl = `${FRONTEND_URL}/?utm_source=email&utm_campaign=wed_reminder&utm_content=${major.id}`;
+  const layoutArgs = {
+    preheader:  `R1 tees off tomorrow — last call for ${major.short} picks.`,
+    heading:    `${major.short} picks lock tomorrow`,
+    intro:      `First tee at <strong>${major.course}</strong> is ${major.teeTimeLabel} — about <strong>~14 hours</strong> away. Your roster is still missing ${missingPieces}.`,
+    ctaLabel:   "Finish your picks",
+    ctaUrl,
+    bodyHtml:   "",
+    footerNote: "Wednesday reminders only fire when your roster is incomplete. Manage in Settings.",
+  };
+  return sendEmail({
+    to:      user.email,
+    subject: `Last call: ${major.name} picks lock tomorrow`,
+    tag:     "wed-reminder",
+    html:    emailHtml(layoutArgs),
+    text:    emailText({ ...layoutArgs, bodyText: `Tee off: ${major.teeTimeLabel}\nRoster gap: ${missingPieces}` }),
+  });
+}
+
+async function checkWedReminderForMajor(majorId) {
+  if (!pool || !EMAIL_ENABLED) return { skipped: true };
+  const meta = MAJORS_META[majorId];
+  if (!meta) return { skipped: true };
+  const now = new Date();
+  // Only Wed evening within the picks-open window for an upcoming major.
+  // Day-of-week is computed in ET to match tournament cadence.
+  const etDay = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const dayOfWeek = etDay.getDay(); // 0 Sun … 3 Wed
+  const hour = etDay.getHours();
+  if (dayOfWeek !== 3 || hour < 17) return { skipped: true, reason: "not Wed evening ET" };
+  if (new Date(meta.picksOpenDate) > now) return { skipped: true, reason: "picks not yet open" };
+  if (majorStatus(majorId, now) !== "upcoming") return { skipped: true, reason: "major no longer upcoming" };
+  // Recipients: members of any league that includes this major, prefs on,
+  // not already sent, AND missing starters/bench rows for THIS major.
+  const { rows: recipients } = await pool.query(
+    `SELECT DISTINCT u.id, u.email, u.display_name, lm.team_id, lm.league_id,
+            p.starters, p.bench
+       FROM users u
+       JOIN league_members lm ON lm.user_id = u.id
+       JOIN leagues l         ON l.id = lm.league_id
+       LEFT JOIN notification_prefs np ON np.user_id = u.id
+       LEFT JOIN notification_log nl
+              ON nl.user_id = u.id AND nl.kind = 'wed_reminder' AND nl.major_id = $1
+       LEFT JOIN picks p
+              ON p.team_id = lm.team_id AND p.major_id = $1 AND p.league_id = lm.league_id
+      WHERE COALESCE(np.wed_reminder, true) = true
+        AND nl.user_id IS NULL
+        AND u.email IS NOT NULL
+        AND (l.included_majors IS NULL OR $1 = ANY(l.included_majors))`,
+    [majorId]
+  );
+  const results = { sent: 0, failed: 0, total: 0 };
+  for (const u of recipients) {
+    const starters = Array.isArray(u.starters) ? u.starters.filter(Boolean) : [];
+    const bench    = Array.isArray(u.bench)    ? u.bench.filter(Boolean)    : [];
+    const needStart = Math.max(0, 4 - starters.length);
+    const needBench = Math.max(0, 2 - bench.length);
+    if (needStart === 0 && needBench === 0) continue;
+    results.total++;
+    const reserved = await reserveNotification({ userId: u.id, kind: "wed_reminder", majorId });
+    if (!reserved) continue;
+    const missing = [
+      needStart && `${needStart} starter${needStart === 1 ? "" : "s"}`,
+      needBench && `${needBench} bench`,
+    ].filter(Boolean).join(" + ");
+    try {
+      const { id } = await sendWedReminderEmail({ email: u.email, displayName: u.display_name }, { id: majorId, ...meta }, missing);
+      if (id) {
+        await pool.query(
+          `UPDATE notification_log SET message_id = $1
+            WHERE user_id = $2 AND kind = 'wed_reminder' AND major_id = $3 AND round IS NULL`,
+          [id, u.id, majorId]
+        );
+      }
+      results.sent++;
+    } catch (err) {
+      console.error(`[wed_reminder] failed for user ${u.id}:`, err.message);
+      await pool.query(
+        `DELETE FROM notification_log
+          WHERE user_id = $1 AND kind = 'wed_reminder' AND major_id = $2 AND round IS NULL AND message_id IS NULL`,
+        [u.id, majorId]
+      );
+      results.failed++;
+    }
+  }
+  if (results.total > 0) console.log(`[wed_reminder] ${majorId}: sent=${results.sent} failed=${results.failed} total=${results.total}`);
+  return results;
+}
+
+// ───────── Round wrap digest (R1, R2, R3, R4) ─────────────────────────────
+// Per-user digest stacking each league the user is in, summarizing the
+// round that just finished. Idempotent per (user, major, round).
+async function sendRoundWrapEmail(user, major, round, leagueLines, mcAlertHtml) {
+  const ctaUrl = `${FRONTEND_URL}/?utm_source=email&utm_campaign=round_wrap&utm_content=${major.id}_r${round}`;
+  const isFinal = round === 4;
+  const layoutArgs = {
+    preheader:  isFinal ? `${major.short} is in the books — final standings inside.`
+                        : `${major.short} R${round} wrap — your team and standings.`,
+    heading:    isFinal ? `${major.short} — Final` : `${major.short} — Round ${round} wrap`,
+    intro:      isFinal ? `The 2026 ${major.name} is complete. Here's how your teams finished.`
+                        : `Round ${round} is in the books. Here's where you stand.`,
+    ctaLabel:   isFinal ? "See final standings" : "Open the live leaderboard",
+    ctaUrl,
+    bodyHtml:   `${mcAlertHtml || ""}${leagueLines}`,
+    footerNote: isFinal ? "Season averages update automatically." : "Manage round-end digests in Settings.",
+  };
+  return sendEmail({
+    to:      user.email,
+    subject: isFinal ? `${major.name}: Final standings` : `${major.short} R${round}: Round wrap`,
+    tag:     "round-wrap",
+    html:    emailHtml(layoutArgs),
+    text:    emailText({ ...layoutArgs, bodyText: `${major.short} Round ${round} wrap. Open onlymajors.com for full standings.` }),
+  });
+}
+
+async function checkRoundWrapForMajor(majorId) {
+  if (!pool || !EMAIL_ENABLED) return { skipped: true };
+  const meta = MAJORS_META[majorId];
+  if (!meta?.roundEnds) return { skipped: true };
+  const now = new Date();
+  // Detect which round JUST ended — the most recent r{N} whose end time is
+  // in the past and within the last 12 hours.
+  let triggerRound = null;
+  for (const round of [1, 2, 3, 4]) {
+    const endTime = new Date(meta.roundEnds[`r${round}`]).getTime();
+    if (endTime <= now.getTime() && now.getTime() - endTime < 12 * 60 * 60 * 1000) {
+      triggerRound = round;
+    }
+  }
+  if (!triggerRound) return { skipped: true, reason: "no round just ended" };
+  // Recipients: every member of any league including this major, prefs on,
+  // not already sent for this round.
+  const { rows: recipients } = await pool.query(
+    `SELECT DISTINCT u.id, u.email, u.display_name
+       FROM users u
+       JOIN league_members lm ON lm.user_id = u.id
+       JOIN leagues l         ON l.id = lm.league_id
+       LEFT JOIN notification_prefs np ON np.user_id = u.id
+       LEFT JOIN notification_log nl
+              ON nl.user_id = u.id AND nl.kind = 'round_wrap' AND nl.major_id = $1 AND nl.round = $2
+      WHERE COALESCE(np.round_wrap, true) = true
+        AND nl.user_id IS NULL
+        AND u.email IS NOT NULL
+        AND (l.included_majors IS NULL OR $1 = ANY(l.included_majors))`,
+    [majorId, triggerRound]
+  );
+  const results = { sent: 0, failed: 0, total: recipients.length, round: triggerRound };
+  for (const u of recipients) {
+    // Build a per-league summary line (stub for now — we have enough hooks
+    // in the codebase to flesh this out later when standings logic moves to
+    // backend; for v1 the digest is a clean "see standings" funnel.)
+    const leagueLines = `
+      <p style="color:${BRAND.body};font-size:14px;line-height:1.55;margin:0 0 12px;">
+        Round ${triggerRound} wrapped. Open the live leaderboard to see how your roster moved and where you stand in each league.
+      </p>`;
+    // MC alert: if this is R2 and the user has MC starters, prepend a callout.
+    let mcAlertHtml = "";
+    if (triggerRound === 2) {
+      mcAlertHtml = await buildMcAlertBlock(u.id, majorId);
+    }
+    const reserved = await reserveNotification({ userId: u.id, kind: "round_wrap", majorId, round: triggerRound });
+    if (!reserved) continue;
+    try {
+      const { id } = await sendRoundWrapEmail({ email: u.email, displayName: u.display_name }, { id: majorId, ...meta }, triggerRound, leagueLines, mcAlertHtml);
+      if (id) {
+        await pool.query(
+          `UPDATE notification_log SET message_id = $1
+            WHERE user_id = $2 AND kind = 'round_wrap' AND major_id = $3 AND round = $4`,
+          [id, u.id, majorId, triggerRound]
+        );
+      }
+      // Also mark mc_alert sent if we included one, so we don't double-send.
+      if (mcAlertHtml) {
+        await reserveNotification({ userId: u.id, kind: "mc_alert", majorId, round: triggerRound, messageId: id });
+      }
+      results.sent++;
+    } catch (err) {
+      console.error(`[round_wrap] failed for user ${u.id}:`, err.message);
+      await pool.query(
+        `DELETE FROM notification_log
+          WHERE user_id = $1 AND kind = 'round_wrap' AND major_id = $2 AND round = $3 AND message_id IS NULL`,
+        [u.id, majorId, triggerRound]
+      );
+      results.failed++;
+    }
+  }
+  if (results.total > 0) console.log(`[round_wrap] ${majorId} R${triggerRound}: sent=${results.sent} failed=${results.failed} total=${results.total}`);
+  return results;
+}
+
+// MC alert block — piggybacks on the R2 round-wrap. Returns "" if the user
+// has no MC starters or has opted out, otherwise a small callout HTML block.
+async function buildMcAlertBlock(userId, majorId) {
+  try {
+    // Honor mc_alert pref.
+    const { rows: prefRows } = await pool.query(
+      `SELECT mc_alert FROM notification_prefs WHERE user_id = $1`, [userId]
+    );
+    if (prefRows.length && prefRows[0].mc_alert === false) return "";
+    // Quick read of the user's picks + an EARN sentinel for cut status. The
+    // round_snapshots table tracks status ('MC', 'WD', 'CUT'); if any of
+    // the user's starters has status indicating they missed the cut, fire.
+    const { rows: cutRows } = await pool.query(
+      `SELECT 1
+         FROM league_members lm
+         JOIN picks p ON p.team_id = lm.team_id AND p.major_id = $2 AND p.league_id = lm.league_id
+        WHERE lm.user_id = $1
+          AND EXISTS (
+            SELECT 1 FROM round_snapshots rs
+             WHERE rs.major_id = $2 AND rs.round = 2 AND rs.status IN ('MC','WD','CUT')
+               AND rs.dg_id::text = ANY (
+                 SELECT jsonb_array_elements_text(p.starters)
+               )
+          )
+        LIMIT 1`,
+      [userId, majorId]
+    );
+    if (!cutRows.length) return "";
+    return `
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:0 0 16px;background:#fdf3ed;border:1px solid #f0d9c8;border-radius:8px;">
+        <tr><td style="padding:12px 14px;">
+          <div style="color:#8a3a1a;font-size:11px;text-transform:uppercase;letter-spacing:0.18em;font-weight:600;">Subs available</div>
+          <div style="color:${BRAND.ink};font-size:14px;font-weight:600;margin-top:3px;">A starter missed the cut.</div>
+          <div style="color:${BRAND.body};font-size:13px;line-height:1.5;margin-top:4px;">Sub them out before Saturday tees off so their non-earnings stop counting.</div>
+        </td></tr>
+      </table>`;
+  } catch (err) {
+    console.error("[mc_alert] block build failed:", err.message);
+    return "";
+  }
+}
+
+// ───────── Saturday final-sub reminder ────────────────────────────────────
+// Fires Saturday evening (~9pm course-local) to users who still have unused
+// bench AND at least one MC/struggling starter — i.e., users for whom subbing
+// out would change their team total.
+async function sendSatReminderEmail(user, major) {
+  const ctaUrl = `${FRONTEND_URL}/?utm_source=email&utm_campaign=sat_reminder&utm_content=${major.id}`;
+  const layoutArgs = {
+    preheader:  `Sunday tees off in hours — last sub window for ${major.short}.`,
+    heading:    `Last sub window: ${major.short}`,
+    intro:      `Sunday's final round at ${major.course} tees off in the morning. You still have bench moves available and at least one starter who's out of contention.`,
+    ctaLabel:   "Review your subs",
+    ctaUrl,
+    bodyHtml:   "",
+    footerNote: "Saturday reminders only fire when subs would change your total.",
+  };
+  return sendEmail({
+    to:      user.email,
+    subject: `Last sub window: ${major.name}`,
+    tag:     "sat-reminder",
+    html:    emailHtml(layoutArgs),
+    text:    emailText({ ...layoutArgs, bodyText: `Sunday final round tomorrow. Open the picks page to make subs.` }),
+  });
+}
+
+async function checkSatReminderForMajor(majorId) {
+  if (!pool || !EMAIL_ENABLED) return { skipped: true };
+  const meta = MAJORS_META[majorId];
+  if (!meta) return { skipped: true };
+  const now = new Date();
+  // Only Saturday evening ET (~6pm-11pm) during a live major.
+  const etDay = new Date(now.toLocaleString("en-US", { timeZone: "America/New_York" }));
+  const dayOfWeek = etDay.getDay(); // 6 = Saturday
+  const hour = etDay.getHours();
+  if (dayOfWeek !== 6 || hour < 18) return { skipped: true, reason: "not Sat evening ET" };
+  if (majorStatus(majorId, now) !== "live") return { skipped: true, reason: "major not live" };
+  // Candidates: in a league w/ this major, prefs on, not already sent, has
+  // picks with at least one MC/WD/CUT starter and at least one bench player
+  // currently NOT subbed in (i.e. still on the bench).
+  const { rows: recipients } = await pool.query(
+    `SELECT DISTINCT u.id, u.email, u.display_name, lm.team_id, lm.league_id, p.starters, p.bench, p.subs
+       FROM users u
+       JOIN league_members lm ON lm.user_id = u.id
+       JOIN leagues l         ON l.id = lm.league_id
+       JOIN picks p           ON p.team_id = lm.team_id AND p.major_id = $1 AND p.league_id = lm.league_id
+       LEFT JOIN notification_prefs np ON np.user_id = u.id
+       LEFT JOIN notification_log nl
+              ON nl.user_id = u.id AND nl.kind = 'sat_reminder' AND nl.major_id = $1
+      WHERE COALESCE(np.sat_reminder, true) = true
+        AND nl.user_id IS NULL
+        AND u.email IS NOT NULL
+        AND (l.included_majors IS NULL OR $1 = ANY(l.included_majors))`,
+    [majorId]
+  );
+  const results = { sent: 0, failed: 0, total: 0 };
+  for (const u of recipients) {
+    // Eligibility: at least one MC/WD/CUT starter + at least one unused bench
+    const starters = Array.isArray(u.starters) ? u.starters.filter(Boolean) : [];
+    const bench    = Array.isArray(u.bench)    ? u.bench.filter(Boolean)    : [];
+    const subs     = Array.isArray(u.subs)     ? u.subs                     : [];
+    const subbedIn = new Set(subs.map(s => s?.in).filter(Boolean));
+    const unusedBench = bench.filter(g => !subbedIn.has(g));
+    if (unusedBench.length === 0) continue;
+    // Check at least one starter has cut/MC status.
+    const { rows: cutRows } = await pool.query(
+      `SELECT 1 FROM round_snapshots
+        WHERE major_id = $1 AND round = 2 AND status IN ('MC','WD','CUT')
+          AND dg_id::text = ANY ($2::text[]) LIMIT 1`,
+      [majorId, starters.map(String)]
+    );
+    if (!cutRows.length) continue;
+    results.total++;
+    const reserved = await reserveNotification({ userId: u.id, kind: "sat_reminder", majorId });
+    if (!reserved) continue;
+    try {
+      const { id } = await sendSatReminderEmail({ email: u.email, displayName: u.display_name }, { id: majorId, ...meta });
+      if (id) {
+        await pool.query(
+          `UPDATE notification_log SET message_id = $1
+            WHERE user_id = $2 AND kind = 'sat_reminder' AND major_id = $3 AND round IS NULL`,
+          [id, u.id, majorId]
+        );
+      }
+      results.sent++;
+    } catch (err) {
+      console.error(`[sat_reminder] failed for user ${u.id}:`, err.message);
+      await pool.query(
+        `DELETE FROM notification_log
+          WHERE user_id = $1 AND kind = 'sat_reminder' AND major_id = $2 AND round IS NULL AND message_id IS NULL`,
+        [u.id, majorId]
+      );
+      results.failed++;
+    }
+  }
+  if (results.total > 0) console.log(`[sat_reminder] ${majorId}: sent=${results.sent} failed=${results.failed} total=${results.total}`);
+  return results;
+}
+
 async function runNotificationSweep() {
   if (!pool || !EMAIL_ENABLED) return;
   try {
     for (const majorId of Object.keys(MAJORS_META)) {
       await checkPicksOpenForMajor(majorId);
+      await checkWedReminderForMajor(majorId);
+      await checkRoundWrapForMajor(majorId);
+      await checkSatReminderForMajor(majorId);
     }
   } catch (err) {
     console.error("[notifications] sweep failed:", err);
@@ -929,9 +1273,66 @@ async function runNotificationSweep() {
 app.post("/api/admin/notifications/sweep", requireAuth, async (req, res) => {
   const results = {};
   for (const majorId of Object.keys(MAJORS_META)) {
-    results[majorId] = await checkPicksOpenForMajor(majorId);
+    results[majorId] = {
+      picks_open:   await checkPicksOpenForMajor(majorId),
+      wed_reminder: await checkWedReminderForMajor(majorId),
+      round_wrap:   await checkRoundWrapForMajor(majorId),
+      sat_reminder: await checkSatReminderForMajor(majorId),
+    };
   }
   res.json({ ok: true, results });
+});
+
+// ── /api/me/notifications ─────────────────────────────────────────────────
+// GET → current preference toggles for the authed user.
+// PUT → upsert; body keys default to the existing value if omitted.
+app.get("/api/me/notifications", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const prefs = await getOrCreatePrefs(req.user.id);
+    res.json({
+      picksOpen:   prefs.picks_open,
+      wedReminder: prefs.wed_reminder,
+      roundWrap:   prefs.round_wrap,
+      mcAlert:     prefs.mc_alert,
+      satReminder: prefs.sat_reminder,
+    });
+  } catch (err) {
+    console.error("[GET /api/me/notifications] failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+app.put("/api/me/notifications", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  const b = req.body || {};
+  const bool = (v, fallback) => (typeof v === "boolean" ? v : fallback);
+  try {
+    const current = await getOrCreatePrefs(req.user.id);
+    const next = {
+      picks_open:   bool(b.picksOpen,   current.picks_open),
+      wed_reminder: bool(b.wedReminder, current.wed_reminder),
+      round_wrap:   bool(b.roundWrap,   current.round_wrap),
+      mc_alert:     bool(b.mcAlert,     current.mc_alert),
+      sat_reminder: bool(b.satReminder, current.sat_reminder),
+    };
+    await pool.query(
+      `UPDATE notification_prefs
+          SET picks_open = $2, wed_reminder = $3, round_wrap = $4,
+              mc_alert = $5, sat_reminder = $6, updated_at = NOW()
+        WHERE user_id = $1`,
+      [req.user.id, next.picks_open, next.wed_reminder, next.round_wrap, next.mc_alert, next.sat_reminder]
+    );
+    res.json({
+      picksOpen:   next.picks_open,
+      wedReminder: next.wed_reminder,
+      roundWrap:   next.round_wrap,
+      mcAlert:     next.mc_alert,
+      satReminder: next.sat_reminder,
+    });
+  } catch (err) {
+    console.error("[PUT /api/me/notifications] failed:", err);
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // Admin-only test endpoint to verify the email pipeline end-to-end.
@@ -2958,8 +3359,9 @@ app.listen(PORT, async () => {
   // initSchema started at boot; this just gives it a moment if it's racing.
   setTimeout(() => loadSnapshotsFromDB(), 1000);
   // Notification sweep — runs once 30s after boot (so initSchema has settled)
-  // and then every 6 hours. Picks Open fires the first time a major's
-  // picksOpenDate is past; idempotent via notification_log.
+  // and then every hour. Each notification type has its own day-of-week /
+  // hour-of-day gate; the hourly sweep is what makes those gates fire
+  // promptly. All triggers idempotent via notification_log.
   setTimeout(() => { runNotificationSweep(); }, 30_000);
-  setInterval(()  => { runNotificationSweep(); }, 6 * 60 * 60_000);
+  setInterval(()  => { runNotificationSweep(); }, 60 * 60_000);
 });
