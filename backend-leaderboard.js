@@ -80,6 +80,47 @@ async function initSchema() {
     console.warn("⚠  DATABASE_URL not set — running with in-memory state only");
     return;
   }
+  // Pre-flight: ensure the users table + member_number column exist FIRST,
+  // before anything else that might fail. Each statement is isolated so a
+  // failure here can't block the others. Idempotent.
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id            BIGSERIAL PRIMARY KEY,
+        email         TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        display_name  TEXT,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS member_number INT`);
+    await pool.query(`
+      DO $$ BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint WHERE conname = 'users_member_number_key'
+        ) THEN
+          BEGIN
+            ALTER TABLE users ADD CONSTRAINT users_member_number_key UNIQUE (member_number);
+          EXCEPTION WHEN duplicate_object THEN NULL;
+          END;
+        END IF;
+      END $$;
+    `);
+    await pool.query(`
+      WITH ranked AS (
+        SELECT id, ROW_NUMBER() OVER (ORDER BY created_at ASC, id ASC) AS rn
+          FROM users WHERE member_number IS NULL
+      ),
+      offset_val AS (SELECT COALESCE(MAX(member_number), 0) AS off FROM users)
+      UPDATE users SET member_number = offset_val.off + ranked.rn
+        FROM ranked, offset_val
+       WHERE users.id = ranked.id
+    `);
+    console.log("✓  member_number column ensured + backfilled");
+  } catch (err) {
+    console.error("⚠  pre-flight member_number migration failed:", err.message);
+  }
+
   // Base tables (idempotent)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS leagues (
@@ -2029,18 +2070,42 @@ app.post("/api/auth/signup", async (req, res) => {
   }
 });
 
-// POST /api/auth/login  { email, password } → { token, user, leagues }
+// POST /api/auth/login  { identifier, password } → { token, user, leagues }
+//   identifier = email address OR membership number (with or without leading #)
+//   Backwards-compatible: also accepts { email, password } for older clients.
 app.post("/api/auth/login", async (req, res) => {
   if (!requireDb(res)) return;
-  const { email, password } = req.body || {};
-  if (!isValidEmail(email) || !password) return res.status(400).json({ error: "email + password required" });
+  const body = req.body || {};
+  const identifier = String(body.identifier ?? body.email ?? "").trim();
+  const password = body.password;
+  if (!identifier || !password) {
+    return res.status(400).json({ error: "email or membership number + password required" });
+  }
   try {
-    const { rows } = await pool.query(
-      `SELECT id, password_hash FROM users WHERE email = $1`,
-      [email.trim().toLowerCase()]
-    );
+    // Decide which column to match. A bare digit string (e.g. "1") or one
+    // prefixed with "#" (e.g. "#1") is treated as a membership number;
+    // anything else is treated as an email.
+    const numericPart = identifier.replace(/^#/, "").trim();
+    const isMemberNumber = /^\d+$/.test(numericPart) && numericPart.length > 0 && numericPart.length < 12;
+    let rows;
+    if (isMemberNumber) {
+      try {
+        ({ rows } = await pool.query(
+          `SELECT id, password_hash FROM users WHERE member_number = $1`,
+          [Number(numericPart)]
+        ));
+      } catch (e) {
+        if (e.code === "42703") return res.status(503).json({ error: "membership numbers not yet available — sign in with email instead" });
+        throw e;
+      }
+    } else {
+      ({ rows } = await pool.query(
+        `SELECT id, password_hash FROM users WHERE lower(email) = $1`,
+        [identifier.toLowerCase()]
+      ));
+    }
     if (!rows.length || !verifyPassword(password, rows[0].password_hash)) {
-      return res.status(401).json({ error: "incorrect email or password" });
+      return res.status(401).json({ error: "incorrect login or password" });
     }
     const userId = Number(rows[0].id);
     const token = newSessionToken();
@@ -2824,12 +2889,24 @@ app.get("/api/me/leagues-summary", requireAuth, async (req, res) => {
       };
     }
     // Fetch the caller's membership number for the membership-card UI.
-    const meRow = (await pool.query(
-      `SELECT member_number FROM users WHERE id = $1`, [userId]
-    )).rows[0];
+    // Fault-tolerant: if member_number column hasn't been added yet on a
+    // given environment, fall back to null so the whole endpoint doesn't 500.
+    let memberNumber = null;
+    try {
+      const meRow = (await pool.query(
+        `SELECT member_number FROM users WHERE id = $1`, [userId]
+      )).rows[0];
+      memberNumber = meRow?.member_number != null ? Number(meRow.member_number) : null;
+    } catch (e) {
+      if (e.code === "42703") {
+        console.warn("[leagues-summary] member_number column missing — returning null");
+      } else {
+        throw e;
+      }
+    }
     res.json({
       me: {
-        memberNumber: meRow?.member_number != null ? Number(meRow.member_number) : null,
+        memberNumber,
       },
       leagues: leagueRows.map(r => ({
         league: {
