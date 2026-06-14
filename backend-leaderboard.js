@@ -2362,11 +2362,13 @@ async function meAndLeagues(userId) {
 //   - returns { token, user, leagues }
 app.post("/api/auth/signup", async (req, res) => {
   if (!requireDb(res)) return;
-  const { email, password, displayName, teamId, leagueCode = "EXPERTS" } = req.body || {};
+  // leagueCode is now OPTIONAL — by default we create the account only and
+  // let the user pick a league from the Clubhouse. Pass leagueCode in only
+  // if you want the legacy "join on signup" behavior.
+  const { email, password, displayName, teamId, leagueCode = null } = req.body || {};
   if (!isValidEmail(email))            return res.status(400).json({ error: "invalid email" });
   if (!password || password.length < 6) return res.status(400).json({ error: "password must be at least 6 characters" });
   if (!displayName || !displayName.trim()) return res.status(400).json({ error: "displayName required" });
-
 
   const normalizedEmail = email.trim().toLowerCase();
   const client = await pool.connect();
@@ -2378,7 +2380,27 @@ app.post("/api/auth/signup", async (req, res) => {
       await client.query("ROLLBACK");
       return res.status(409).json({ error: "email already registered" });
     }
-    // Resolve league + member_model.
+    // Account-only signup path: create user, issue token, return. Skip all
+    // the league join + slot claim machinery.
+    if (!leagueCode) {
+      const u = await client.query(
+        `INSERT INTO users (email, password_hash, display_name, member_number)
+         VALUES ($1, $2, $3, (SELECT COALESCE(MAX(member_number), 0) + 1 FROM users))
+         RETURNING id, member_number`,
+        [normalizedEmail, hashPassword(password), displayName.trim()]
+      );
+      const userId = Number(u.rows[0].id);
+      const token = newSessionToken();
+      const expires = new Date(Date.now() + SESSION_TTL_DAYS * 24 * 60 * 60 * 1000);
+      await client.query(
+        `INSERT INTO sessions (token, user_id, expires_at) VALUES ($1, $2, $3)`,
+        [token, userId, expires]
+      );
+      await client.query("COMMIT");
+      const payload = await meAndLeagues(userId);
+      return res.json({ token, ...payload });
+    }
+    // Legacy path: signup + league join in one transaction.
     const lr = await client.query(
       `SELECT id, member_model FROM leagues WHERE invite_code = $1`, [leagueCode]
     );
