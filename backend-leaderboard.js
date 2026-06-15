@@ -1549,20 +1549,28 @@ app.put("/api/club-championship/picks/:majorId", requireAuth, async (req, res) =
       return res.status(409).json({ error: "entries closed at first tee" });
     }
     const year = ccYear(majorId);
-    const { rows } = await pool.query(
+    // Upsert. submitted_at intentionally NOT touched on update — it anchors
+    // the "earliest entry" tiebreaker forever.
+    await pool.query(
       `INSERT INTO club_championship_entries
-         (user_id, major_id, year, starters, bench, subs, score_prediction, submitted_at, updated_at)
-       VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, NOW(), NOW())
+         (user_id, major_id, year, starters, bench, subs, score_prediction)
+       VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7)
        ON CONFLICT (user_id, major_id, year)
-       DO UPDATE SET starters = EXCLUDED.starters,
-                     bench    = EXCLUDED.bench,
-                     subs     = EXCLUDED.subs,
-                     score_prediction = EXCLUDED.score_prediction,
-                     updated_at = NOW()
-                     -- submitted_at intentionally NOT updated — it anchors
-                     -- the "earliest entry" tiebreaker forever.
-       RETURNING starters, bench, subs, score_prediction, submitted_at`,
+       DO UPDATE SET
+         starters         = EXCLUDED.starters,
+         bench            = EXCLUDED.bench,
+         subs             = EXCLUDED.subs,
+         score_prediction = EXCLUDED.score_prediction,
+         updated_at       = NOW()`,
       [req.user.id, majorId, year, JSON.stringify(starters), JSON.stringify(bench), JSON.stringify(subs), sp]
+    );
+    // Read back the canonical row so the response reflects what's actually
+    // stored (including the original submitted_at on updates).
+    const { rows } = await pool.query(
+      `SELECT starters, bench, subs, score_prediction, submitted_at
+         FROM club_championship_entries
+        WHERE user_id = $1 AND major_id = $2 AND year = $3`,
+      [req.user.id, majorId, year]
     );
     const r = rows[0] || {};
     res.json({
