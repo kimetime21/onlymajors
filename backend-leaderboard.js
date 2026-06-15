@@ -1532,9 +1532,11 @@ app.put("/api/club-championship/picks/:majorId", requireAuth, async (req, res) =
   const { majorId } = req.params;
   if (!MAJORS_META[majorId]) return res.status(404).json({ error: `unknown major: ${majorId}` });
   const { starters = [], bench = [], subs = [], scorePrediction = null } = req.body || {};
-  // Validation: roster shape matches league play (4 + 2).
-  if (!Array.isArray(starters) || starters.length > 4) {
-    return res.status(400).json({ error: "starters must be an array of up to 4 golfers" });
+  // Validation: Club Championship roster is 6 starters, no bench (different
+  // from league play). Bench accepted but optional — kept in schema for
+  // forward-compat if the format ever expands.
+  if (!Array.isArray(starters) || starters.length > 6) {
+    return res.status(400).json({ error: "starters must be an array of up to 6 golfers" });
   }
   if (!Array.isArray(bench) || bench.length > 2) {
     return res.status(400).json({ error: "bench must be an array of up to 2 golfers" });
@@ -1547,7 +1549,7 @@ app.put("/api/club-championship/picks/:majorId", requireAuth, async (req, res) =
       return res.status(409).json({ error: "entries closed at first tee" });
     }
     const year = ccYear(majorId);
-    await pool.query(
+    const { rows } = await pool.query(
       `INSERT INTO club_championship_entries
          (user_id, major_id, year, starters, bench, subs, score_prediction, submitted_at, updated_at)
        VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6::jsonb, $7, NOW(), NOW())
@@ -1558,10 +1560,20 @@ app.put("/api/club-championship/picks/:majorId", requireAuth, async (req, res) =
                      score_prediction = EXCLUDED.score_prediction,
                      updated_at = NOW()
                      -- submitted_at intentionally NOT updated — it anchors
-                     -- the "earliest entry" tiebreaker forever.`,
+                     -- the "earliest entry" tiebreaker forever.
+       RETURNING starters, bench, subs, score_prediction, submitted_at`,
       [req.user.id, majorId, year, JSON.stringify(starters), JSON.stringify(bench), JSON.stringify(subs), sp]
     );
-    res.json({ ok: true });
+    const r = rows[0] || {};
+    res.json({
+      ok: true,
+      majorId, year, enrolled: true,
+      starters:        r.starters || [],
+      bench:           r.bench || [],
+      subs:            r.subs || [],
+      scorePrediction: r.score_prediction,
+      submittedAt:     r.submitted_at,
+    });
   } catch (err) {
     console.error("[PUT cc picks] failed:", err);
     res.status(500).json({ error: err.message });
