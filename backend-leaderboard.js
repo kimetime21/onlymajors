@@ -411,6 +411,62 @@ async function initSchema() {
     );
   }
 
+  // Defensive standalone migration for Club Championship tables. The main
+  // schema block (above, line ~294) creates these but if anything earlier in
+  // that block fails the transaction rolls back and these tables go missing.
+  // Running them in isolation here guarantees they exist regardless. Each
+  // CREATE TABLE IF NOT EXISTS is idempotent.
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS club_championship_entries (
+        user_id           BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        major_id          TEXT   NOT NULL,
+        year              INT    NOT NULL,
+        starters          JSONB  NOT NULL DEFAULT '[]'::jsonb,
+        bench             JSONB  NOT NULL DEFAULT '[]'::jsonb,
+        subs              JSONB  NOT NULL DEFAULT '[]'::jsonb,
+        score_prediction  INT,
+        submitted_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (user_id, major_id, year)
+      )
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_cc_entries_major
+        ON club_championship_entries (major_id, year)
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS club_championship_results (
+        user_id      BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        major_id     TEXT   NOT NULL,
+        year         INT    NOT NULL,
+        total        NUMERIC NOT NULL DEFAULT 0,
+        rank         INT,
+        updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (user_id, major_id, year)
+      )
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_cc_results_major
+        ON club_championship_results (major_id, year, rank)
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS club_championship_archive (
+        major_id          TEXT NOT NULL,
+        year              INT  NOT NULL,
+        champion_user_id  BIGINT REFERENCES users(id) ON DELETE SET NULL,
+        champion_name     TEXT NOT NULL,
+        champion_total    NUMERIC NOT NULL,
+        runners_up        JSONB DEFAULT '[]'::jsonb,
+        finalized_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (major_id, year)
+      )
+    `);
+    console.log("✓  club_championship_* tables ensured");
+  } catch (err) {
+    console.error("⚠  CC table migration failed:", err.message);
+  }
+
   // Now add the league_id columns. Existing rows backfill to 1, which is a
   // valid FK target now that league 1 exists.
   // Defensive standalone migration for member_number — runs as its own query
@@ -1583,8 +1639,17 @@ app.put("/api/club-championship/picks/:majorId", requireAuth, async (req, res) =
       submittedAt:     r.submitted_at,
     });
   } catch (err) {
+    // Verbose error reporting — includes the Postgres error code and detail
+    // so we can pinpoint schema mismatches without digging through Railway
+    // logs. Safe to leave in: req.body never echoed back.
     console.error("[PUT cc picks] failed:", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({
+      error:  err.message,
+      code:   err.code || null,
+      detail: err.detail || null,
+      where:  err.where || null,
+      hint:   err.hint || null,
+    });
   }
 });
 
