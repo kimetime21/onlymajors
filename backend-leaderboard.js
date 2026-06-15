@@ -1831,6 +1831,49 @@ async function fetchDG(path, params = {}) {
   return await res.json();
 }
 
+// Pulls tournament-specific betting favorites from DataGolf and returns a
+// Map<dg_id, { rank, winOdds, top10 }> for the requested major. Used by
+// /api/field to mark which players are the top-30 favorites going into the
+// event. Cached 15 minutes — odds can shift but not by much hour-to-hour.
+//
+// Source: DataGolf /preds/pre-tournament — returns win/top5/top10/top20/
+// make_cut/win odds for the next upcoming event. Only used during picks-
+// open week (when /preds/in-play hasn't taken over yet). If the response's
+// event_id doesn't match the requested major, we treat it as "no favorites
+// data" and the frontend falls back to A-Z for everyone.
+async function fetchFavoritesForMajor(majorId) {
+  const eventId = DG_EVENT_IDS[majorId];
+  if (!eventId) return new Map();
+  return cached(`dg-favs:${majorId}`, 15 * 60_000, async () => {
+    try {
+      const data = await fetchDG("/preds/pre-tournament", { tour: "pga", odds_format: "percent" });
+      const respEventId = data?.event_id ?? data?.eventId ?? null;
+      if (!data || !respEventId || Number(respEventId) !== Number(eventId)) {
+        return new Map();
+      }
+      const rows = Array.isArray(data?.baseline) ? data.baseline
+                 : Array.isArray(data?.players)  ? data.players
+                 : Array.isArray(data)            ? data
+                 : [];
+      // Sort by win odds DESC (highest win probability = most favored).
+      const scored = rows.map(r => ({
+        dgId:    Number(r.dg_id),
+        winOdds: Number(r.win),
+        top10:   Number(r.top_10 ?? r.top10),
+      })).filter(r => Number.isFinite(r.dgId) && Number.isFinite(r.winOdds));
+      scored.sort((a, b) => b.winOdds - a.winOdds);
+      const map = new Map();
+      scored.forEach((r, i) => {
+        map.set(r.dgId, { rank: i + 1, winOdds: r.winOdds, top10: r.top10 });
+      });
+      return map;
+    } catch (err) {
+      console.warn(`[favorites:${majorId}] fetch failed:`, err.message);
+      return new Map();
+    }
+  });
+}
+
 // ─────────────────────────────────────────────────────────────
 // Name → frontend golferId resolver.
 // ─────────────────────────────────────────────────────────────
@@ -2472,15 +2515,27 @@ app.get("/api/field/:majorId", async (req, res) => {
     // Hydrate name maps + build rich response.
     hydrateNameMaps(rawPlayers);
 
+    // Pull betting-favorites for this major (pre-tournament DG odds). Used to
+    // rank the top section of the picker. Soft failure → empty map → frontend
+    // just falls back to pure A-Z grouping.
+    const favsMap = await fetchFavoritesForMajor(majorId);
+
     const players = rawPlayers.map(p => {
       const matchedGid = matchGolferId(p.player_name);
       const gid = matchedGid || `dg-${p.dg_id || NORMALIZE(p.player_name)}`;
+      const dgId = p.dg_id ? Number(p.dg_id) : null;
+      const fav = dgId != null ? favsMap.get(dgId) : null;
       return {
         gid,
         name:    prettyName(p.player_name || ""),
         country: p.country || "",
         dg_id:   p.dg_id || null,
         matched: !!matchedGid,
+        // favoriteRank: 1 = top favorite, increasing = less favored. Null if
+        // we have no betting data for this player at this major.
+        favoriteRank: fav?.rank ?? null,
+        winOdds:      fav?.winOdds ?? null,
+        top10Odds:    fav?.top10 ?? null,
       };
     });
 
@@ -2489,6 +2544,7 @@ app.get("/api/field/:majorId", async (req, res) => {
       source,
       eventName,
       lastUpdated,
+      hasFavorites: favsMap.size > 0,
       players,
     });
   } catch (err) {
