@@ -190,6 +190,61 @@ async function initSchema() {
     console.error("⚠  pre-flight member_number migration failed:", err.message);
   }
 
+  // Pre-flight: ensure Club Championship tables exist. CRITICAL — moved up
+  // here (above the main schema block) so it runs even if anything later in
+  // initSchema throws. Without this the CC tables silently never get created
+  // on a fresh Railway DB, and CC PUT/GET endpoints all 500.
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS club_championship_entries (
+        user_id           BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        major_id          TEXT   NOT NULL,
+        year              INT    NOT NULL,
+        starters          JSONB  NOT NULL DEFAULT '[]'::jsonb,
+        bench             JSONB  NOT NULL DEFAULT '[]'::jsonb,
+        subs              JSONB  NOT NULL DEFAULT '[]'::jsonb,
+        score_prediction  INT,
+        submitted_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (user_id, major_id, year)
+      )
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_cc_entries_major
+        ON club_championship_entries (major_id, year)
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS club_championship_results (
+        user_id      BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        major_id     TEXT   NOT NULL,
+        year         INT    NOT NULL,
+        total        NUMERIC NOT NULL DEFAULT 0,
+        rank         INT,
+        updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (user_id, major_id, year)
+      )
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_cc_results_major
+        ON club_championship_results (major_id, year, rank)
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS club_championship_archive (
+        major_id          TEXT NOT NULL,
+        year              INT  NOT NULL,
+        champion_user_id  BIGINT REFERENCES users(id) ON DELETE SET NULL,
+        champion_name     TEXT NOT NULL,
+        champion_total    NUMERIC NOT NULL,
+        runners_up        JSONB DEFAULT '[]'::jsonb,
+        finalized_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (major_id, year)
+      )
+    `);
+    console.log("✓  club_championship_* tables ensured (pre-flight)");
+  } catch (err) {
+    console.error("⚠  CC pre-flight migration failed:", err.message);
+  }
+
   // Base tables (idempotent)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS leagues (
@@ -409,62 +464,6 @@ async function initSchema() {
        ON CONFLICT (league_id, team_id) DO NOTHING`,
       [1, teamId, teamName, color]
     );
-  }
-
-  // Defensive standalone migration for Club Championship tables. The main
-  // schema block (above, line ~294) creates these but if anything earlier in
-  // that block fails the transaction rolls back and these tables go missing.
-  // Running them in isolation here guarantees they exist regardless. Each
-  // CREATE TABLE IF NOT EXISTS is idempotent.
-  try {
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS club_championship_entries (
-        user_id           BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        major_id          TEXT   NOT NULL,
-        year              INT    NOT NULL,
-        starters          JSONB  NOT NULL DEFAULT '[]'::jsonb,
-        bench             JSONB  NOT NULL DEFAULT '[]'::jsonb,
-        subs              JSONB  NOT NULL DEFAULT '[]'::jsonb,
-        score_prediction  INT,
-        submitted_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        updated_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (user_id, major_id, year)
-      )
-    `);
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_cc_entries_major
-        ON club_championship_entries (major_id, year)
-    `);
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS club_championship_results (
-        user_id      BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        major_id     TEXT   NOT NULL,
-        year         INT    NOT NULL,
-        total        NUMERIC NOT NULL DEFAULT 0,
-        rank         INT,
-        updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (user_id, major_id, year)
-      )
-    `);
-    await pool.query(`
-      CREATE INDEX IF NOT EXISTS idx_cc_results_major
-        ON club_championship_results (major_id, year, rank)
-    `);
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS club_championship_archive (
-        major_id          TEXT NOT NULL,
-        year              INT  NOT NULL,
-        champion_user_id  BIGINT REFERENCES users(id) ON DELETE SET NULL,
-        champion_name     TEXT NOT NULL,
-        champion_total    NUMERIC NOT NULL,
-        runners_up        JSONB DEFAULT '[]'::jsonb,
-        finalized_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (major_id, year)
-      )
-    `);
-    console.log("✓  club_championship_* tables ensured");
-  } catch (err) {
-    console.error("⚠  CC table migration failed:", err.message);
   }
 
   // Now add the league_id columns. Existing rows backfill to 1, which is a
