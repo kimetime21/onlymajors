@@ -1679,6 +1679,19 @@ app.get("/api/club-championship/standings/:majorId", requireAuth, async (req, re
       `SELECT COUNT(*)::int AS n FROM club_championship_entries WHERE major_id = $1 AND year = $2`,
       [majorId, year]
     );
+    // Submitters list (everyone who has entered). Ordered by submitted_at so
+    // earliest entries appear first — also the tie-break order for the score
+    // prediction. Pre-tournament this is what the averages widget displays;
+    // during-tournament the top10 results take over.
+    const { rows: submittersRows } = await pool.query(
+      `SELECT e.user_id, u.display_name, u.first_name, u.last_name,
+              e.submitted_at, e.score_prediction
+         FROM club_championship_entries e
+         JOIN users u ON u.id = e.user_id
+        WHERE e.major_id = $1 AND e.year = $2
+        ORDER BY e.submitted_at ASC, e.user_id ASC`,
+      [majorId, year]
+    );
     res.json({
       majorId, year,
       fieldSize: countRows[0]?.n || 0,
@@ -1688,6 +1701,20 @@ app.get("/api/club-championship/standings/:majorId", requireAuth, async (req, re
         total:  Number(r.total),
         rank:   r.rank == null ? null : Number(r.rank),
       })),
+      submitters: submittersRows.map(r => {
+        const first = r.first_name?.trim() || null;
+        const last  = r.last_name?.trim()  || null;
+        // Prefer "First L." for the social context.
+        const name  = (first && last)
+          ? `${first} ${last[0].toUpperCase()}.`
+          : (r.display_name || first || `Member ${r.user_id}`);
+        return {
+          userId:          Number(r.user_id),
+          name,
+          submittedAt:     r.submitted_at,
+          scorePrediction: r.score_prediction,
+        };
+      }),
       you: mine.length ? {
         total: Number(mine[0].total),
         rank:  mine[0].rank == null ? null : Number(mine[0].rank),
