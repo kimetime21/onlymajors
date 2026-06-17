@@ -2564,15 +2564,21 @@ app.get("/api/tee-times/:majorId/:round", async (req, res) => {
     };
     const times = {};
     let sampleTeetimesShape = null;
+    let firstPlayerRaw = null;
     for (const p of field) {
+      // Always capture the first player's full object so we can see EVERY
+      // field DataGolf returns, even ones we haven't seen before. This is the
+      // ground truth for what's in the response.
+      if (!firstPlayerRaw) firstPlayerRaw = p;
       const iso = extractTeeTime(p, round);
       if (!iso) {
-        // Capture the first player's teetimes structure so we can see the
-        // exact shape if extraction still fails.
-        if (!sampleTeetimesShape && p.teetimes != null) {
+        // Capture the teetimes structure regardless of whether it's null —
+        // tells us whether the field exists at all and what it looks like.
+        if (!sampleTeetimesShape) {
           sampleTeetimesShape = {
-            type: Array.isArray(p.teetimes) ? "array" : typeof p.teetimes,
-            value: p.teetimes,
+            present: "teetimes" in p,
+            type:    Array.isArray(p.teetimes) ? "array" : typeof p.teetimes,
+            value:   p.teetimes,
             playerName: p.player_name,
           };
         }
@@ -2592,6 +2598,7 @@ app.get("/api/tee-times/:majorId/:round", async (req, res) => {
       eventName:  data.event_name || null,
       lastUpdated: data.last_updated || null,
       sampleTeetimesShape: Object.keys(times).length === 0 ? sampleTeetimesShape : null,
+      firstPlayerRaw:      Object.keys(times).length === 0 ? firstPlayerRaw : null,
       fieldSize:   field.length,
       times,
     });
