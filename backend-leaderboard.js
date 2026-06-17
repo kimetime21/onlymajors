@@ -2535,70 +2535,63 @@ app.get("/api/tee-times/:majorId/:round", async (req, res) => {
       return res.json({ majorId, round, times: {}, source: "no-field-data" });
     }
     const field = Array.isArray(data.field) ? data.field : [];
-    // DataGolf nests tee times in a `teetimes` field per player. Shape varies
-    // — sometimes an object keyed by round, sometimes an array. extractTeeTime
-    // tries every plausible structure so we're resilient if they tweak it.
+    // DataGolf returns teetimes as an array of per-round objects, each with
+    // shape { round_num, teetime, start_hole, wave, course_name, ... }. We
+    // find the object matching the requested round and return its details.
+    // Legacy fallbacks left in for forward-compat if the schema ever changes.
     const extractTeeTime = (p, r) => {
-      // Top-level fallbacks (some endpoints flatten them).
-      if (p[`r${r}_teetime`])  return p[`r${r}_teetime`];
-      if (p[`r${r}_tee_time`]) return p[`r${r}_tee_time`];
       const tt = p.teetimes;
-      if (!tt) return null;
-      // String → just the R1 tee time
-      if (typeof tt === "string") return r === 1 ? tt : null;
-      // Array → try 1-indexed then 0-indexed
-      if (Array.isArray(tt)) {
-        return tt[r - 1] || tt[r] || null;
+      if (!tt) {
+        // Legacy flat keys.
+        if (p[`r${r}_teetime`])  return { iso: p[`r${r}_teetime`] };
+        if (p[`r${r}_tee_time`]) return { iso: p[`r${r}_tee_time`] };
+        return null;
       }
-      // Object → try every key naming convention
+      if (Array.isArray(tt)) {
+        // Array of per-round objects — find by round_num.
+        const row = tt.find(x => x && Number(x.round_num) === r);
+        if (row?.teetime) {
+          return {
+            iso:       row.teetime,
+            startHole: row.start_hole ?? null,
+            wave:      row.wave || null,
+            courseName: row.course_name || null,
+          };
+        }
+        return null;
+      }
+      // Defensive: handle string/object shapes too in case DG changes.
+      if (typeof tt === "string") return r === 1 ? { iso: tt } : null;
       if (typeof tt === "object") {
-        return tt[`r${r}`]
-            || tt[`round${r}`]
-            || tt[`round_${r}`]
-            || tt[r]
-            || tt[String(r)]
-            || tt[`r${r}_teetime`]
-            || null;
+        const v = tt[`r${r}`] || tt[r] || tt[String(r)] || null;
+        return v ? { iso: v } : null;
       }
       return null;
     };
     const times = {};
-    let sampleTeetimesShape = null;
-    let firstPlayerRaw = null;
     for (const p of field) {
-      // Always capture the first player's full object so we can see EVERY
-      // field DataGolf returns, even ones we haven't seen before. This is the
-      // ground truth for what's in the response.
-      if (!firstPlayerRaw) firstPlayerRaw = p;
-      const iso = extractTeeTime(p, round);
-      if (!iso) {
-        // Capture the teetimes structure regardless of whether it's null —
-        // tells us whether the field exists at all and what it looks like.
-        if (!sampleTeetimesShape) {
-          sampleTeetimesShape = {
-            present: "teetimes" in p,
-            type:    Array.isArray(p.teetimes) ? "array" : typeof p.teetimes,
-            value:   p.teetimes,
-            playerName: p.player_name,
-          };
-        }
-        continue;
-      }
+      const tee = extractTeeTime(p, round);
+      if (!tee?.iso) continue;
       const gid = matchGolferId(p.player_name) || `dg-${p.dg_id || NORMALIZE(p.player_name)}`;
-      const d = new Date(iso);
+      // DataGolf returns "2026-06-18 07:52" — a naive datetime that's already
+      // in ET (course local time). Parse it as ET to avoid TZ drift.
+      const isoUtc = new Date(tee.iso.replace(" ", "T") + "-04:00").toISOString();
+      const d = new Date(isoUtc);
       if (Number.isNaN(d.getTime())) continue;
-      // Pretty label in ET: "8:42 AM ET" / "12:05 PM ET".
       const label = d.toLocaleTimeString("en-US", {
         timeZone: "America/New_York", hour: "numeric", minute: "2-digit"
       }) + " ET";
-      times[gid] = { iso, label };
+      times[gid] = {
+        iso:       isoUtc,
+        label,
+        startHole: tee.startHole,
+        wave:      tee.wave,
+      };
     }
     res.json({
       majorId, round,
       eventName:  data.event_name || null,
       lastUpdated: data.last_updated || null,
-      sampleTeetimesShape: Object.keys(times).length === 0 ? sampleTeetimesShape : null,
-      firstPlayerRaw:      Object.keys(times).length === 0 ? firstPlayerRaw : null,
       fieldSize:   field.length,
       times,
     });
