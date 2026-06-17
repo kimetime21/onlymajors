@@ -2325,16 +2325,16 @@ const CADDIES_CALL_GENERATORS = {
     question_text: "What will the winning score be?",
     type:          "single_choice",
     options: [
-      { key: "under_-10",   label: "Under -10" },
-      { key: "-5_to_-10",   label: "-5 to -10" },
+      { key: "under_-10",   label: "-10 or better" },
+      { key: "-5_to_-10",   label: "-5 to -9" },
       { key: "E_to_-4",     label: "E to -4" },
       { key: "+1_or_worse", label: "+1 or worse" },
     ],
     resolver_data: {
       brackets: [
-        { key: "under_-10",   max: -11 },
-        { key: "-5_to_-10",   min: -10, max: -5 },
-        { key: "E_to_-4",     min: -4,  max: 0 },
+        { key: "under_-10",   max: -10 },
+        { key: "-5_to_-10",   min: -9, max: -5 },
+        { key: "E_to_-4",     min: -4, max: 0 },
         { key: "+1_or_worse", min: 1 },
       ],
     },
@@ -2359,6 +2359,16 @@ const CADDIES_CALL_GENERATORS = {
     type:          "binary",
     options: [{ key: "yes", label: "Yes" }, { key: "no", label: "No" }],
     resolver_data: {},
+  }),
+  team_over_3m: async (m) => ({
+    kind:          "team_over_3m",
+    question_text: "Will YOUR team score more than $3M?",
+    type:          "binary",
+    options: [
+      { key: "over",  label: "Over $3M" },
+      { key: "under", label: "Under $3M" },
+    ],
+    resolver_data: { threshold: 3000000 },
   }),
   top10_player_pick: async (m, ctx) => {
     // Pull the field and pre-tournament OWGR ranks. Players choose one
@@ -2406,19 +2416,19 @@ function pickCaddiesCallGeneratorsForMajor(majorId, year) {
 // Run the factory for a given major + year. Idempotent: if questions
 // already exist for this (major, year), returns them unchanged. Otherwise
 // runs each generator and persists 5 rows in caddies_call_questions.
-async function runCaddiesCallFactory(majorId, year) {
+async function runCaddiesCallFactory(majorId, year, opts = {}) {
   if (!pool) throw new Error("DB not configured");
   const meta = MAJORS_META[majorId];
   if (!meta) throw new Error(`unknown major: ${majorId}`);
-  // Already generated?
+  // Already generated? Skip unless force=true (used for label/option refresh).
   const { rows: existing } = await pool.query(
     `SELECT id, slot, kind, question_text, type, options, resolver_data, locks_at, correct_answer, scored_at
        FROM caddies_call_questions
-      WHERE major_id = $1 AND year = $2
+      WHERE major_id = $1 AND year = $2 AND slot <= 5
       ORDER BY slot ASC`,
     [majorId, year]
   );
-  if (existing.length >= 4) return existing;
+  if (existing.length >= 4 && !opts.force) return existing;
   // Generate and persist.
   const generatorNames = pickCaddiesCallGeneratorsForMajor(majorId, year);
   const locksAt = meta.firstTeeTime ? new Date(meta.firstTeeTime).toISOString() : null;
@@ -2443,6 +2453,179 @@ async function runCaddiesCallFactory(majorId, year) {
          updated_at    = NOW()
        RETURNING id, slot, kind, question_text, type, options, resolver_data, locks_at, correct_answer, scored_at`,
       [majorId, year, i + 1, q.kind, q.question_text, q.type,
+       JSON.stringify(q.options), JSON.stringify(q.resolver_data), locksAt]
+    );
+    out.push(rows[0]);
+  }
+  return out;
+}
+
+// Seed slot 11: the "personal stakes" question — Will YOUR team score more
+// than $3M? Per-user resolution: each member's correct answer depends on
+// their team's actual earnings, computed at scoring time.
+async function runCaddiesCallBonusFactory(majorId, year) {
+  if (!pool) throw new Error("DB not configured");
+  const meta = MAJORS_META[majorId];
+  if (!meta) throw new Error(`unknown major: ${majorId}`);
+  const { rows: existing } = await pool.query(
+    `SELECT id FROM caddies_call_questions
+      WHERE major_id = $1 AND year = $2 AND slot = 11`,
+    [majorId, year]
+  );
+  if (existing.length > 0) return existing;
+  const gen = CADDIES_CALL_GENERATORS.team_over_3m;
+  const q = await gen(meta);
+  const locksAt = meta.firstTeeTime ? new Date(meta.firstTeeTime).toISOString() : null;
+  const { rows } = await pool.query(
+    `INSERT INTO caddies_call_questions
+       (major_id, year, slot, kind, question_text, type, options, resolver_data, locks_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9)
+     ON CONFLICT (major_id, year, slot)
+     DO UPDATE SET
+       kind          = EXCLUDED.kind,
+       question_text = EXCLUDED.question_text,
+       type          = EXCLUDED.type,
+       options       = EXCLUDED.options,
+       resolver_data = EXCLUDED.resolver_data,
+       locks_at      = EXCLUDED.locks_at,
+       updated_at    = NOW()
+     RETURNING id, slot, kind, question_text, type, options, resolver_data, locks_at, correct_answer, scored_at`,
+    [majorId, year, 11, q.kind, q.question_text, q.type,
+     JSON.stringify(q.options), JSON.stringify(q.resolver_data), locksAt]
+  );
+  return rows;
+}
+
+// Compute a user's team total earnings for a major. Uses their PRIMARY
+// league team (earliest membership). Returns 0 if they're not in any
+// league or have no picks for the major.
+async function computeUserTeamTotalForMajor(userId, majorId) {
+  if (!pool) return 0;
+  // Primary league team (earliest membership).
+  const { rows: mems } = await pool.query(
+    `SELECT lm.team_id FROM league_members lm
+      WHERE lm.user_id = $1
+      ORDER BY lm.joined_at ASC NULLS LAST, lm.id ASC
+      LIMIT 1`,
+    [userId]
+  );
+  if (!mems.length) return 0;
+  const teamId = mems[0].team_id;
+  const { rows: picks } = await pool.query(
+    `SELECT starters, subs FROM picks WHERE team_id = $1 AND major_id = $2`,
+    [teamId, majorId]
+  );
+  if (!picks.length) return 0;
+  const starters = picks[0].starters || [];
+  const subs     = picks[0].subs || [];
+  // Reflect subs: replace starter gid with subbed-in gid (matches league play scoring).
+  const finalStarters = starters.map((gid, i) => {
+    const sub = (Array.isArray(subs) ? subs : []).find(s => s?.outIndex === i);
+    return sub?.in || gid;
+  });
+  // Sum earnings from SNAPSHOTS.
+  const snap = SNAPSHOTS[majorId];
+  if (!snap) return 0;
+  let total = 0;
+  for (const gid of finalStarters) {
+    if (!gid) continue;
+    const dgId = GID_TO_DGID.get(gid);
+    if (dgId == null) continue;
+    const row = snap[dgId];
+    if (!row) continue;
+    total += Number(row.earnings || row.money || 0);
+  }
+  return total;
+}
+
+// Generate H2H matchup questions from DataGolf. Returns up to `count`
+// questions, ordered by how close to 50/50 the matchup is (i.e., the most
+// interesting ones go first). If DG returns nothing, returns [].
+async function generateMatchupQuestions(majorMeta, count = 5) {
+  try {
+    const data = await fetchDG("/betting-tools/matchups", { tour: "pga", market: "tournament_matchups", odds_format: "decimal" }).catch(() => null);
+    let pool = Array.isArray(data?.match_list) ? data.match_list
+             : Array.isArray(data?.matchups)   ? data.matchups
+             : Array.isArray(data)             ? data
+             : [];
+    if (pool.length === 0) {
+      // Fall back to round 1 matchups if tournament-level isn't available.
+      const data2 = await fetchDG("/betting-tools/matchups", { tour: "pga", market: "round_matchups", round: 1, odds_format: "decimal" }).catch(() => null);
+      pool = Array.isArray(data2?.match_list) ? data2.match_list
+           : Array.isArray(data2?.matchups)   ? data2.matchups
+           : Array.isArray(data2)             ? data2
+           : [];
+    }
+    if (pool.length === 0) return [];
+    // Closer to 50/50 = more interesting. Score by absolute distance from 0.5.
+    const scored = pool.map(m => {
+      const p1 = Number(m.odds?.datagolf?.p1 ?? m.dg_p1_prob ?? 0.5);
+      const p1Prob = p1 > 1 ? 1 / p1 : p1; // handle decimal odds vs probability
+      return { m, dist: Math.abs(p1Prob - 0.5) };
+    });
+    scored.sort((a, b) => a.dist - b.dist);
+    const selected = scored.slice(0, count).map(s => s.m);
+    return selected.map(m => {
+      const p1Raw = m.p1_player_name || m.player_1 || "";
+      const p2Raw = m.p2_player_name || m.player_2 || "";
+      const p1Name = prettyName(p1Raw);
+      const p2Name = prettyName(p2Raw);
+      const p1Gid = matchGolferId(p1Raw) || `dg-${m.p1_dg_id || m.dg_id_1 || NORMALIZE(p1Raw)}`;
+      const p2Gid = matchGolferId(p2Raw) || `dg-${m.p2_dg_id || m.dg_id_2 || NORMALIZE(p2Raw)}`;
+      return {
+        kind:          "head_to_head_matchup",
+        question_text: `Lower 4-round total: ${p1Name} or ${p2Name}?`,
+        type:          "binary",
+        options: [
+          { key: p1Gid, label: p1Name },
+          { key: p2Gid, label: p2Name },
+        ],
+        resolver_data: { p1Gid, p2Gid, p1Name, p2Name },
+      };
+    });
+  } catch (err) {
+    console.warn("[matchup gen] failed:", err.message);
+    return [];
+  }
+}
+
+// Run the matchups factory: seeds slots 6-10 with H2H matchup questions.
+// Idempotent — re-running won't duplicate. Each slot is preserved if already
+// populated.
+async function runCaddiesCallMatchupsFactory(majorId, year) {
+  if (!pool) throw new Error("DB not configured");
+  const meta = MAJORS_META[majorId];
+  if (!meta) throw new Error(`unknown major: ${majorId}`);
+  const { rows: existing } = await pool.query(
+    `SELECT id, slot FROM caddies_call_questions
+      WHERE major_id = $1 AND year = $2 AND slot BETWEEN 6 AND 10`,
+    [majorId, year]
+  );
+  if (existing.length >= 5) return existing;
+  const questions = await generateMatchupQuestions(meta, 5);
+  if (questions.length === 0) {
+    throw new Error("DataGolf returned no matchups (probably not published yet)");
+  }
+  const locksAt = meta.firstTeeTime ? new Date(meta.firstTeeTime).toISOString() : null;
+  const out = [];
+  for (let i = 0; i < questions.length; i++) {
+    const q = questions[i];
+    const slot = 6 + i;
+    const { rows } = await pool.query(
+      `INSERT INTO caddies_call_questions
+         (major_id, year, slot, kind, question_text, type, options, resolver_data, locks_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9)
+       ON CONFLICT (major_id, year, slot)
+       DO UPDATE SET
+         kind          = EXCLUDED.kind,
+         question_text = EXCLUDED.question_text,
+         type          = EXCLUDED.type,
+         options       = EXCLUDED.options,
+         resolver_data = EXCLUDED.resolver_data,
+         locks_at      = EXCLUDED.locks_at,
+         updated_at    = NOW()
+       RETURNING id, slot, kind, question_text, type, options, resolver_data, locks_at, correct_answer, scored_at`,
+      [majorId, year, slot, q.kind, q.question_text, q.type,
        JSON.stringify(q.options), JSON.stringify(q.resolver_data), locksAt]
     );
     out.push(rows[0]);
@@ -2508,7 +2691,7 @@ app.put("/api/caddies-call/:majorId/:slot", requireAuth, async (req, res) => {
   const { majorId } = req.params;
   const slot = parseInt(req.params.slot, 10);
   if (!MAJORS_META[majorId]) return res.status(404).json({ error: `unknown major: ${majorId}` });
-  if (!slot || slot < 1 || slot > 5) return res.status(400).json({ error: "slot must be 1-5" });
+  if (!slot || slot < 1 || slot > 11) return res.status(400).json({ error: "slot must be 1-11" });
   const { answer } = req.body || {};
   if (!answer || typeof answer !== "string") return res.status(400).json({ error: "answer required" });
   try {
@@ -2617,6 +2800,24 @@ async function resolveCaddiesCallQuestion(question, majorId) {
       // Pack the top-10 gids into the correct_answer field as a JSON array.
       return JSON.stringify(finished.map(p => p.gid));
     }
+    case "head_to_head_matchup": {
+      // Whoever has the lower total wins. Both must have completed the
+      // tournament (or both DNF in same way) for the question to resolve.
+      const { p1Gid, p2Gid } = question.resolver_data || {};
+      if (!p1Gid || !p2Gid) return null;
+      const p1 = finalScores.find(p => p.gid === p1Gid);
+      const p2 = finalScores.find(p => p.gid === p2Gid);
+      if (!p1 || !p2) return null;
+      // If one missed cut and other made it, made-cut wins.
+      const p1Made = p1.r3 != null && p1.r4 != null;
+      const p2Made = p2.r3 != null && p2.r4 != null;
+      if (p1Made && !p2Made) return p1Gid;
+      if (p2Made && !p1Made) return p2Gid;
+      if (!p1Made && !p2Made) return "push";
+      if (p1.total < p2.total) return p1Gid;
+      if (p2.total < p1.total) return p2Gid;
+      return "push";
+    }
     default:
       return null;
   }
@@ -2648,6 +2849,21 @@ async function runCaddiesCallScoring(majorId) {
   let resolvedCount = 0;
   for (const q of questions) {
     if (q.correct_answer) continue;
+    // team_over_3m has no single correct answer — it's per-user. Mark it as
+    // "PER_USER" so the scoring loop knows it's ready to evaluate, then the
+    // per-user branch in scoring computes each member's actual outcome.
+    if (q.kind === "team_over_3m") {
+      // Only mark scoreable once snapshots actually exist for the major.
+      if (SNAPSHOTS[majorId] && Object.keys(SNAPSHOTS[majorId]).length > 0) {
+        await pool.query(
+          `UPDATE caddies_call_questions SET correct_answer = 'PER_USER', scored_at = NOW(), updated_at = NOW()
+            WHERE id = $1`,
+          [q.id]
+        );
+        resolvedCount++;
+      }
+      continue;
+    }
     const answer = await resolveCaddiesCallQuestion({
       id: q.id, kind: q.kind, options: q.options, resolver_data: q.resolver_data
     }, majorId);
@@ -2674,12 +2890,34 @@ async function runCaddiesCallScoring(majorId) {
     [questionIds]
   );
   const qById = Object.fromEntries(scoredQs.map(q => [q.id, q]));
+  // Pre-compute team totals for users who answered the team_over_3m question
+  // — that one's per-user, can't be resolved with a single correct answer.
+  const teamQuestionIds = scoredQs.filter(q => q.kind === "team_over_3m").map(q => q.id);
+  const teamTotals = {};
+  if (teamQuestionIds.length > 0) {
+    const { rows: relevantUsers } = await pool.query(
+      `SELECT DISTINCT user_id FROM caddies_call_answers WHERE question_id = ANY($1::bigint[])`,
+      [teamQuestionIds]
+    );
+    for (const u of relevantUsers) {
+      teamTotals[u.user_id] = await computeUserTeamTotalForMajor(u.user_id, majorId);
+    }
+  }
   const byUser = {};
   for (const a of allAnswers) {
     const q = qById[a.question_id];
     if (!q) continue;
     if (!byUser[a.user_id]) byUser[a.user_id] = { correct: 0, answered: 0 };
     byUser[a.user_id].answered += 1;
+    // team_over_3m: per-user — compare their team total to threshold.
+    if (q.kind === "team_over_3m") {
+      const threshold = q.resolver_data?.threshold || 3000000;
+      const total = teamTotals[a.user_id] || 0;
+      const actuallyOver = total > threshold;
+      const userPickedOver = a.answer === "over";
+      if (userPickedOver === actuallyOver) byUser[a.user_id].correct += 1;
+      continue;
+    }
     if (scoreCaddiesCallAnswer(q, a.answer)) byUser[a.user_id].correct += 1;
   }
   for (const userId of Object.keys(byUser)) {
@@ -2735,6 +2973,38 @@ app.get("/api/me/caddies-call/summary", requireAuth, async (req, res) => {
   }
 });
 
+// Admin-only: trigger the bonus factory (slot 11 — "Will your team score
+// more than $3M?"). Idempotent.
+app.post("/api/admin/caddies-call/:majorId/run-bonus-factory", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  const { majorId } = req.params;
+  if (!MAJORS_META[majorId]) return res.status(404).json({ error: `unknown major: ${majorId}` });
+  try {
+    const year = ccYearForMajor(majorId);
+    const result = await runCaddiesCallBonusFactory(majorId, year);
+    res.json({ ok: true, majorId, year, bonusCount: result.length });
+  } catch (err) {
+    console.error("[POST admin/caddies-call/run-bonus-factory] failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin-only: trigger the matchups factory (slots 6-10). Pulls live H2H
+// matchups from DataGolf, picks the 5 closest-to-50/50 ones.
+app.post("/api/admin/caddies-call/:majorId/run-matchups-factory", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  const { majorId } = req.params;
+  if (!MAJORS_META[majorId]) return res.status(404).json({ error: `unknown major: ${majorId}` });
+  try {
+    const year = ccYearForMajor(majorId);
+    const result = await runCaddiesCallMatchupsFactory(majorId, year);
+    res.json({ ok: true, majorId, year, matchupCount: result.length });
+  } catch (err) {
+    console.error("[POST admin/caddies-call/run-matchups-factory] failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Admin-only: trigger the factory manually. Will become an automatic
 // cron-triggered run at picks-open Monday in Phase 3.
 app.post("/api/admin/caddies-call/:majorId/run-factory", requireAuth, async (req, res) => {
@@ -2743,8 +3013,11 @@ app.post("/api/admin/caddies-call/:majorId/run-factory", requireAuth, async (req
   if (!MAJORS_META[majorId]) return res.status(404).json({ error: `unknown major: ${majorId}` });
   try {
     const year = ccYearForMajor(majorId);
-    const result = await runCaddiesCallFactory(majorId, year);
-    res.json({ ok: true, majorId, year, questionCount: result.length });
+    // ?force=true (or {force:true} body) refreshes existing questions — used
+    // when generator labels/options change after seeding.
+    const force = req.query.force === "true" || req.body?.force === true;
+    const result = await runCaddiesCallFactory(majorId, year, { force });
+    res.json({ ok: true, majorId, year, questionCount: result.length, refreshed: force });
   } catch (err) {
     console.error("[POST admin/caddies-call/run-factory] failed:", err);
     res.status(500).json({ error: err.message });
