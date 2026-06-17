@@ -1193,12 +1193,12 @@ async function sendRoundWrapEmail(user, major, round, leagueLines, mcAlertHtml, 
   const ctaUrl = `${FRONTEND_URL}/?utm_source=email&utm_campaign=round_wrap&utm_content=${major.id}_r${round}`;
   const isFinal = round === 4;
   const layoutArgs = {
-    preheader:  isFinal ? `${major.short} is in the books — final standings inside.`
-                        : `${major.short} R${round} wrap — your team and standings.`,
+    preheader:  isFinal ? `${major.short} is in the books — final Money List inside.`
+                        : `${major.short} R${round} wrap — your team and Money List.`,
     heading:    isFinal ? `${major.short} — Final` : `${major.short} — Round ${round} wrap`,
     intro:      isFinal ? `The 2026 ${major.name} is complete. Here's how your teams finished.`
                         : `Round ${round} is in the books. Here's where you stand.`,
-    ctaLabel:   isFinal ? "See final standings" : "Open the live leaderboard",
+    ctaLabel:   isFinal ? "See the Money List" : "Open the Leaderboard",
     ctaUrl,
     // Order: MC alert (R2 only) → per-league lines → Club Championship block.
     // Each piece returns "" when it has nothing to render.
@@ -1207,10 +1207,10 @@ async function sendRoundWrapEmail(user, major, round, leagueLines, mcAlertHtml, 
   };
   return sendEmail({
     to:      user.email,
-    subject: isFinal ? `${major.name}: Final standings` : `${major.short} R${round}: Round wrap`,
+    subject: isFinal ? `${major.name}: Final Money List` : `${major.short} R${round}: Round wrap`,
     tag:     "round-wrap",
     html:    emailHtml(layoutArgs),
-    text:    emailText({ ...layoutArgs, bodyText: `${major.short} Round ${round} wrap. Open onlymajors.com for full standings.` }),
+    text:    emailText({ ...layoutArgs, bodyText: `${major.short} Round ${round} wrap. Open onlymajors.com for the full Money List.` }),
   });
 }
 
@@ -1249,10 +1249,10 @@ async function checkRoundWrapForMajor(majorId) {
   for (const u of recipients) {
     // Build a per-league summary line (stub for now — we have enough hooks
     // in the codebase to flesh this out later when standings logic moves to
-    // backend; for v1 the digest is a clean "see standings" funnel.)
+    // backend; for v1 the digest is a clean "see the Leaderboard" funnel.)
     const leagueLines = `
       <p style="color:${BRAND.body};font-size:14px;line-height:1.55;margin:0 0 12px;">
-        Round ${triggerRound} wrapped. Open the live leaderboard to see how your roster moved and where you stand in each league.
+        Round ${triggerRound} wrapped. Open the Leaderboard to see how your roster moved, and check the Money List for where you stand across the season.
       </p>`;
     // MC alert: if this is R2 and the user has MC starters, prepend a callout.
     let mcAlertHtml = "";
@@ -1437,7 +1437,7 @@ async function sendSatReminderEmail(user, major) {
     subject: `Last sub window: ${major.name}`,
     tag:     "sat-reminder",
     html:    emailHtml(layoutArgs),
-    text:    emailText({ ...layoutArgs, bodyText: `Sunday final round tomorrow. Open the picks page to make subs.` }),
+    text:    emailText({ ...layoutArgs, bodyText: `Sunday final round tomorrow. Open My Picks to make subs.` }),
   });
 }
 
@@ -1799,6 +1799,45 @@ app.put("/api/me/notifications", requireAuth, async (req, res) => {
     });
   } catch (err) {
     console.error("[PUT /api/me/notifications] failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Public status endpoint — diagnoses why emails might not be flowing.
+// Reveals NO secrets: just config flags + recent notification_log activity.
+app.get("/api/admin/email-status", async (req, res) => {
+  try {
+    const out = {
+      emailEnabled:        !!RESEND_API_KEY,
+      apiKeyConfigured:    !!RESEND_API_KEY,
+      apiKeyLength:        RESEND_API_KEY ? RESEND_API_KEY.length : 0,
+      from:                EMAIL_FROM || null,
+      replyTo:             EMAIL_REPLY_TO || null,
+      notificationSweepRunning: !!global.__notificationSweepStarted,
+    };
+    if (pool) {
+      const { rows: recent } = await pool.query(
+        `SELECT kind, COUNT(*)::int AS count, MAX(sent_at) AS most_recent
+           FROM notification_log
+          GROUP BY kind
+          ORDER BY most_recent DESC NULLS LAST`
+      );
+      out.recentActivity = recent;
+      const { rows: prefRows } = await pool.query(
+        `SELECT
+           COUNT(*) FILTER (WHERE picks_open)   AS picks_open_on,
+           COUNT(*) FILTER (WHERE wed_reminder) AS wed_reminder_on,
+           COUNT(*) FILTER (WHERE round_wrap)   AS round_wrap_on,
+           COUNT(*) FILTER (WHERE mc_alert)     AS mc_alert_on,
+           COUNT(*) FILTER (WHERE sat_reminder) AS sat_reminder_on,
+           COUNT(*)::int AS total
+         FROM notification_prefs`
+      );
+      out.notificationPrefSummary = prefRows[0];
+    }
+    res.json(out);
+  } catch (err) {
+    console.error("[admin/email-status] failed:", err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -4052,6 +4091,7 @@ app.listen(PORT, async () => {
   // and then every hour. Each notification type has its own day-of-week /
   // hour-of-day gate; the hourly sweep is what makes those gates fire
   // promptly. All triggers idempotent via notification_log.
+  global.__notificationSweepStarted = true;
   setTimeout(() => { runNotificationSweep(); }, 30_000);
   setInterval(()  => { runNotificationSweep(); }, 60 * 60_000);
 });
