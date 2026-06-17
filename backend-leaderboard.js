@@ -2973,6 +2973,125 @@ app.get("/api/me/caddies-call/summary", requireAuth, async (req, res) => {
   }
 });
 
+// GET /api/caddies-call/:majorId/averages — clubhouse-wide consensus on
+// every question for a major. Each row carries the question + the count
+// of members who picked each option, plus the total submitter count.
+// Used by the new Clubhouse CaddiesCallCard's averages dropdown.
+app.get("/api/caddies-call/:majorId/averages", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  const { majorId } = req.params;
+  if (!MAJORS_META[majorId]) return res.status(404).json({ error: `unknown major: ${majorId}` });
+  try {
+    const year = ccYearForMajor(majorId);
+    const { rows: questions } = await pool.query(
+      `SELECT id, slot, kind, question_text, type, options, correct_answer, scored_at
+         FROM caddies_call_questions
+        WHERE major_id = $1 AND year = $2
+        ORDER BY slot ASC`,
+      [majorId, year]
+    );
+    const qIds = questions.map(q => Number(q.id));
+    let countsByQuestion = {};
+    if (qIds.length > 0) {
+      const { rows: tallies } = await pool.query(
+        `SELECT question_id, answer, COUNT(*)::int AS n
+           FROM caddies_call_answers
+          WHERE question_id = ANY($1::int[])
+          GROUP BY question_id, answer`,
+        [qIds]
+      );
+      countsByQuestion = tallies.reduce((acc, t) => {
+        const k = Number(t.question_id);
+        if (!acc[k]) acc[k] = {};
+        acc[k][t.answer] = t.n;
+        return acc;
+      }, {});
+    }
+    // Total distinct submitters for the major (anyone who answered ≥1 Q)
+    const { rows: subRows } = await pool.query(
+      `SELECT COUNT(DISTINCT a.user_id)::int AS n
+         FROM caddies_call_answers a
+         JOIN caddies_call_questions q ON q.id = a.question_id
+        WHERE q.major_id = $1 AND q.year = $2`,
+      [majorId, year]
+    );
+    const totalSubmitters = subRows[0]?.n || 0;
+    res.json({
+      majorId, year, totalSubmitters,
+      questions: questions.map(q => {
+        const id = Number(q.id);
+        const tallies = countsByQuestion[id] || {};
+        const totalThisQ = Object.values(tallies).reduce((a, b) => a + b, 0);
+        const opts = (q.options || []).map(o => ({
+          key:   o.key,
+          label: o.label,
+          count: tallies[o.key] || 0,
+          pct:   totalThisQ > 0 ? Math.round(((tallies[o.key] || 0) / totalThisQ) * 1000) / 10 : 0,
+        }));
+        return {
+          id, slot: q.slot, kind: q.kind,
+          questionText:  q.question_text,
+          type:          q.type,
+          options:       opts,
+          totalAnswers:  totalThisQ,
+          correctAnswer: q.correct_answer,
+          scoredAt:      q.scored_at,
+        };
+      }),
+    });
+  } catch (err) {
+    console.error("[GET caddies-call/averages] failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/caddies-call/hall-of-fame — clubhouse-wide career leaderboard.
+// Surfaces top callers by Call Rate (min 5 answered) and by total wins.
+// Used by the new Clubhouse CaddiesCallCard's HoF dropdown.
+app.get("/api/caddies-call/hall-of-fame", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const minAnswered = 5;
+    const { rows } = await pool.query(
+      `SELECT u.id AS user_id,
+              u.first_name, u.last_name, u.display_name, u.member_number,
+              COALESCE(SUM(r.correct),0)::int  AS correct,
+              COALESCE(SUM(r.answered),0)::int AS answered,
+              COUNT(r.major_id)::int            AS majors_played
+         FROM users u
+         LEFT JOIN caddies_call_results r ON r.user_id = u.id
+        GROUP BY u.id, u.first_name, u.last_name, u.display_name, u.member_number
+       HAVING COALESCE(SUM(r.answered),0) >= $1
+        ORDER BY (COALESCE(SUM(r.correct),0)::float
+                / NULLIF(COALESCE(SUM(r.answered),0),0)) DESC NULLS LAST,
+                 COALESCE(SUM(r.correct),0) DESC`,
+      [minAnswered]
+    );
+    const fmtName = (r) => {
+      const f = r.first_name, l = r.last_name;
+      if (f && l) return `${f} ${l[0].toUpperCase()}.`;
+      return r.display_name || `Member #${r.member_number || "?"}`;
+    };
+    const callers = rows.map(r => ({
+      userId:       Number(r.user_id),
+      name:         fmtName(r),
+      memberNumber: r.member_number,
+      correct:      r.correct,
+      answered:     r.answered,
+      majorsPlayed: r.majors_played,
+      callRate:     r.answered > 0 ? Math.round((r.correct / r.answered) * 1000) / 10 : null,
+    }));
+    res.json({
+      minAnswered,
+      topCallRate: callers.slice(0, 10),
+      topWins:     [...callers].sort((a, b) => b.correct - a.correct).slice(0, 10),
+    });
+  } catch (err) {
+    console.error("[GET caddies-call/hall-of-fame] failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Admin-only: trigger the bonus factory (slot 11 — "Will your team score
 // more than $3M?"). Idempotent.
 app.post("/api/admin/caddies-call/:majorId/run-bonus-factory", requireAuth, async (req, res) => {
