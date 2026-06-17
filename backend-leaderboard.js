@@ -290,6 +290,63 @@ async function initSchema() {
     console.error("⚠  notification pre-flight migration failed:", err.message);
   }
 
+  // Pre-flight: Caddie's Call tables. 19th-Hole side game where members
+  // answer 5 auto-generated prop questions per major. Phase 1: schema only,
+  // endpoints exist but dormant (no frontend yet). Phase 2+ ship for The
+  // Open in July.
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS caddies_call_questions (
+        id              BIGSERIAL PRIMARY KEY,
+        major_id        TEXT   NOT NULL,
+        year            INT    NOT NULL,
+        slot            INT    NOT NULL,
+        kind            TEXT   NOT NULL,
+        question_text   TEXT   NOT NULL,
+        type            TEXT   NOT NULL,
+        options         JSONB  NOT NULL DEFAULT '[]'::jsonb,
+        resolver_data   JSONB  NOT NULL DEFAULT '{}'::jsonb,
+        locks_at        TIMESTAMPTZ,
+        correct_answer  TEXT,
+        scored_at       TIMESTAMPTZ,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_caddies_call_q_slot
+        ON caddies_call_questions (major_id, year, slot)
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS caddies_call_answers (
+        user_id      BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        question_id  BIGINT NOT NULL REFERENCES caddies_call_questions(id) ON DELETE CASCADE,
+        answer       TEXT NOT NULL,
+        submitted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (user_id, question_id)
+      )
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_caddies_call_a_question
+        ON caddies_call_answers (question_id)
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS caddies_call_results (
+        user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        major_id   TEXT   NOT NULL,
+        year       INT    NOT NULL,
+        correct    INT    NOT NULL DEFAULT 0,
+        answered   INT    NOT NULL DEFAULT 0,
+        scored_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (user_id, major_id, year)
+      )
+    `);
+    console.log("✓  caddies_call_* tables ensured (pre-flight)");
+  } catch (err) {
+    console.error("⚠  Caddie's Call pre-flight migration failed:", err.message);
+  }
+
   // Base tables (idempotent)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS leagues (
@@ -2244,6 +2301,455 @@ function recordRoundSnapshotInPlay(majorId, currentRound, players) {
     }
   }
 }
+
+// ───────── Caddie's Call — Phase 1 skeleton ─────────────────────────────
+// 19th-Hole side game: 5 prop questions per major, auto-generated from
+// DataGolf data. Phase 1 ships 4 starter generators with hardcoded options
+// (course-aware thresholds come in Phase 2). The factory selects 5
+// generators from the library, runs them, persists the question rows.
+//
+// Question generator shape:
+//   {
+//     kind:           "winning_score" | "hole_in_one" | ...,
+//     question_text:  user-facing string,
+//     type:           "single_choice" | "binary" | "player_pick",
+//     options:        [{ key, label }, ...],
+//     resolver_data:  arbitrary JSON the scoring job needs at resolve time
+//   }
+//
+// Each generator is `async (majorMeta, ctx) => ({ ... })`. Async so future
+// generators can hit DataGolf for course-specific historical data.
+const CADDIES_CALL_GENERATORS = {
+  winning_score: async (m) => ({
+    kind:          "winning_score",
+    question_text: "What will the winning score be?",
+    type:          "single_choice",
+    options: [
+      { key: "under_-10",   label: "Under -10" },
+      { key: "-5_to_-10",   label: "-5 to -10" },
+      { key: "E_to_-4",     label: "E to -4" },
+      { key: "+1_or_worse", label: "+1 or worse" },
+    ],
+    resolver_data: {
+      brackets: [
+        { key: "under_-10",   max: -11 },
+        { key: "-5_to_-10",   min: -10, max: -5 },
+        { key: "E_to_-4",     min: -4,  max: 0 },
+        { key: "+1_or_worse", min: 1 },
+      ],
+    },
+  }),
+  hole_in_one: async () => ({
+    kind:          "hole_in_one",
+    question_text: "Will there be at least one hole-in-one in the field?",
+    type:          "binary",
+    options: [{ key: "yes", label: "Yes" }, { key: "no", label: "No" }],
+    resolver_data: {},
+  }),
+  round_of_63: async () => ({
+    kind:          "round_of_63",
+    question_text: "Will any player shoot 63 or lower in any round?",
+    type:          "binary",
+    options: [{ key: "yes", label: "Yes" }, { key: "no", label: "No" }],
+    resolver_data: { threshold: 63 },
+  }),
+  thirty_six_hole_leader_wins: async () => ({
+    kind:          "thirty_six_hole_leader_wins",
+    question_text: "Will the 36-hole leader win the tournament?",
+    type:          "binary",
+    options: [{ key: "yes", label: "Yes" }, { key: "no", label: "No" }],
+    resolver_data: {},
+  }),
+  top10_player_pick: async (m, ctx) => {
+    // Pull the field and pre-tournament OWGR ranks. Players choose one
+    // from the OWGR Top 50 to "lock" as a top-10 finish.
+    try {
+      const owgrMap = await fetchOwgrMap();
+      const fieldData = await fetchDG("/field-updates", { tour: "pga" }).catch(() => null);
+      const field = Array.isArray(fieldData?.field) ? fieldData.field : [];
+      const ranked = field
+        .map(p => ({
+          gid:   matchGolferId(p.player_name) || `dg-${p.dg_id || NORMALIZE(p.player_name)}`,
+          name:  prettyName(p.player_name || ""),
+          rank:  owgrMap.get(Number(p.dg_id))?.rank ?? 9999,
+        }))
+        .filter(r => r.rank <= 75)
+        .sort((a, b) => a.rank - b.rank)
+        .slice(0, 50);
+      return {
+        kind:          "top10_player_pick",
+        question_text: "Pick a player to finish top-10",
+        type:          "player_pick",
+        options: ranked.map(r => ({ key: r.gid, label: `${r.name} · #${r.rank}` })),
+        resolver_data: {},
+      };
+    } catch (err) {
+      // Field not available yet — fall back to a stub.
+      return {
+        kind:          "top10_player_pick",
+        question_text: "Pick a player to finish top-10",
+        type:          "player_pick",
+        options: [],
+        resolver_data: { error: err.message },
+      };
+    }
+  },
+};
+
+// Pick which generators to use for a given major. Phase 1: hardcoded to
+// the 4 starter generators. Phase 3 (post-Open) replaces this with a
+// scoring algorithm that picks 5 from the full ~20-question library.
+function pickCaddiesCallGeneratorsForMajor(majorId, year) {
+  return ["winning_score", "hole_in_one", "round_of_63", "thirty_six_hole_leader_wins", "top10_player_pick"];
+}
+
+// Run the factory for a given major + year. Idempotent: if questions
+// already exist for this (major, year), returns them unchanged. Otherwise
+// runs each generator and persists 5 rows in caddies_call_questions.
+async function runCaddiesCallFactory(majorId, year) {
+  if (!pool) throw new Error("DB not configured");
+  const meta = MAJORS_META[majorId];
+  if (!meta) throw new Error(`unknown major: ${majorId}`);
+  // Already generated?
+  const { rows: existing } = await pool.query(
+    `SELECT id, slot, kind, question_text, type, options, resolver_data, locks_at, correct_answer, scored_at
+       FROM caddies_call_questions
+      WHERE major_id = $1 AND year = $2
+      ORDER BY slot ASC`,
+    [majorId, year]
+  );
+  if (existing.length >= 4) return existing;
+  // Generate and persist.
+  const generatorNames = pickCaddiesCallGeneratorsForMajor(majorId, year);
+  const locksAt = meta.firstTeeTime ? new Date(meta.firstTeeTime).toISOString() : null;
+  const out = [];
+  for (let i = 0; i < generatorNames.length; i++) {
+    const name = generatorNames[i];
+    const gen  = CADDIES_CALL_GENERATORS[name];
+    if (!gen) continue;
+    const q = await gen(meta, { majorId, year });
+    const { rows } = await pool.query(
+      `INSERT INTO caddies_call_questions
+         (major_id, year, slot, kind, question_text, type, options, resolver_data, locks_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9)
+       ON CONFLICT (major_id, year, slot)
+       DO UPDATE SET
+         kind          = EXCLUDED.kind,
+         question_text = EXCLUDED.question_text,
+         type          = EXCLUDED.type,
+         options       = EXCLUDED.options,
+         resolver_data = EXCLUDED.resolver_data,
+         locks_at      = EXCLUDED.locks_at,
+         updated_at    = NOW()
+       RETURNING id, slot, kind, question_text, type, options, resolver_data, locks_at, correct_answer, scored_at`,
+      [majorId, year, i + 1, q.kind, q.question_text, q.type,
+       JSON.stringify(q.options), JSON.stringify(q.resolver_data), locksAt]
+    );
+    out.push(rows[0]);
+  }
+  return out;
+}
+
+// ─────────── Caddie's Call routes (dormant — no frontend uses these yet) ─
+// GET  /api/caddies-call/:majorId        → list questions + current user's answers
+// PUT  /api/caddies-call/:majorId/:slot   → submit/update an answer (locks at first tee)
+// POST /api/admin/caddies-call/:majorId/run-factory → seed questions (manual trigger)
+function ccYearForMajor(majorId) {
+  const meta = MAJORS_META[majorId];
+  if (meta?.firstTeeTime) return new Date(meta.firstTeeTime).getFullYear();
+  return new Date().getFullYear();
+}
+
+app.get("/api/caddies-call/:majorId", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  const { majorId } = req.params;
+  if (!MAJORS_META[majorId]) return res.status(404).json({ error: `unknown major: ${majorId}` });
+  try {
+    const year = ccYearForMajor(majorId);
+    const { rows: questions } = await pool.query(
+      `SELECT id, slot, kind, question_text, type, options, locks_at, correct_answer, scored_at
+         FROM caddies_call_questions
+        WHERE major_id = $1 AND year = $2
+        ORDER BY slot ASC`,
+      [majorId, year]
+    );
+    const { rows: myAnswers } = await pool.query(
+      `SELECT a.question_id, a.answer, a.submitted_at, a.updated_at
+         FROM caddies_call_answers a
+         JOIN caddies_call_questions q ON q.id = a.question_id
+        WHERE a.user_id = $1 AND q.major_id = $2 AND q.year = $3`,
+      [req.user.id, majorId, year]
+    );
+    const answerMap = Object.fromEntries(myAnswers.map(a => [a.question_id, a]));
+    res.json({
+      majorId, year,
+      locksAt: questions[0]?.locks_at || null,
+      questions: questions.map(q => ({
+        id:             Number(q.id),
+        slot:           q.slot,
+        kind:           q.kind,
+        questionText:   q.question_text,
+        type:           q.type,
+        options:        q.options || [],
+        correctAnswer:  q.correct_answer,
+        scoredAt:       q.scored_at,
+        myAnswer:       answerMap[q.id]?.answer || null,
+        mySubmittedAt:  answerMap[q.id]?.submitted_at || null,
+      })),
+    });
+  } catch (err) {
+    console.error("[GET caddies-call] failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put("/api/caddies-call/:majorId/:slot", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  const { majorId } = req.params;
+  const slot = parseInt(req.params.slot, 10);
+  if (!MAJORS_META[majorId]) return res.status(404).json({ error: `unknown major: ${majorId}` });
+  if (!slot || slot < 1 || slot > 5) return res.status(400).json({ error: "slot must be 1-5" });
+  const { answer } = req.body || {};
+  if (!answer || typeof answer !== "string") return res.status(400).json({ error: "answer required" });
+  try {
+    const year = ccYearForMajor(majorId);
+    const { rows } = await pool.query(
+      `SELECT id, locks_at FROM caddies_call_questions
+        WHERE major_id = $1 AND year = $2 AND slot = $3`,
+      [majorId, year, slot]
+    );
+    if (!rows.length) return res.status(404).json({ error: "question not found" });
+    const q = rows[0];
+    if (q.locks_at && new Date(q.locks_at) <= new Date()) {
+      return res.status(409).json({ error: "Caddie's Call locks at first tee" });
+    }
+    await pool.query(
+      `INSERT INTO caddies_call_answers (user_id, question_id, answer)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (user_id, question_id)
+       DO UPDATE SET answer = EXCLUDED.answer, updated_at = NOW()`,
+      [req.user.id, q.id, answer]
+    );
+    res.json({ ok: true, questionId: Number(q.id), answer });
+  } catch (err) {
+    console.error("[PUT caddies-call] failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Resolve a single Caddie's Call question against tournament outcomes.
+// Returns the correct answer key, or null if it can't be resolved yet.
+// All resolvers read from SNAPSHOTS (which is the authoritative source for
+// completed majors). Add new question types here as more generators ship.
+async function resolveCaddiesCallQuestion(question, majorId) {
+  const snap = SNAPSHOTS[majorId];
+  if (!snap) return null;
+  const allEntries = Object.entries(snap);
+  if (allEntries.length === 0) return null;
+  // Helper: per-player total stroke counts and finish positions from snapshot.
+  const finalScores = allEntries
+    .map(([dgIdStr, s]) => {
+      const dgId = Number(dgIdStr);
+      const gid  = DGID_TO_GID.get(dgId) || `dg-${dgId}`;
+      const r1   = s.r1_score ?? null;
+      const r2   = s.r2_score ?? null;
+      const r3   = s.r3_score ?? null;
+      const r4   = s.r4_score ?? null;
+      const total = [r1, r2, r3, r4].filter(x => typeof x === "number").reduce((a, b) => a + b, 0);
+      return { dgId, gid, r1, r2, r3, r4, total, finalPosition: s.position ?? null, status: s.status || "ok" };
+    })
+    .filter(p => p.r1 != null && p.r2 != null);
+  switch (question.kind) {
+    case "winning_score": {
+      // Lowest 4-round total → score vs par. Par 70 for U.S. Open Shinnecock;
+      // for Phase 1 we hardcode 280 (4 × 70). Phase 2 puts par in MAJORS_META.
+      const par = 280;
+      const finished = finalScores.filter(p => p.r3 != null && p.r4 != null);
+      if (!finished.length) return null;
+      const winner = finished.reduce((a, b) => a.total < b.total ? a : b);
+      const scoreToPar = winner.total - par;
+      const brackets = question.resolver_data?.brackets || [];
+      for (const b of brackets) {
+        if ((b.min == null || scoreToPar >= b.min) && (b.max == null || scoreToPar <= b.max)) {
+          return b.key;
+        }
+      }
+      return null;
+    }
+    case "hole_in_one": {
+      // Phase 1: stub. The snapshot doesn't track ace events directly. For
+      // now, count it as "no" once tournament wraps. Phase 2: parse DG's
+      // per-hole event log when we ingest it.
+      const finished = finalScores.filter(p => p.r4 != null);
+      if (!finished.length) return null;
+      return "no";
+    }
+    case "round_of_63": {
+      // Yes if any round score is <= 63 (assuming par 70 → -7).
+      const lowest = finalScores
+        .flatMap(p => [p.r1, p.r2, p.r3, p.r4].filter(x => typeof x === "number"));
+      if (!lowest.length) return null;
+      return Math.min(...lowest) <= 63 ? "yes" : "no";
+    }
+    case "thirty_six_hole_leader_wins": {
+      // Player with lowest r1+r2 vs player with lowest r1+r2+r3+r4.
+      const after36 = finalScores
+        .filter(p => p.r1 != null && p.r2 != null)
+        .map(p => ({ ...p, t36: p.r1 + p.r2 }))
+        .sort((a, b) => a.t36 - b.t36);
+      const finished = finalScores
+        .filter(p => p.r3 != null && p.r4 != null)
+        .sort((a, b) => a.total - b.total);
+      if (!after36.length || !finished.length) return null;
+      const leader36 = after36[0];
+      const winner   = finished[0];
+      return leader36.gid === winner.gid ? "yes" : "no";
+    }
+    case "top10_player_pick": {
+      // Each user's answer is a gid. We don't return a single "correct"
+      // answer — the scoring loop handles this case by checking each
+      // user's answer against the actual top-10 list. Return a marker.
+      const finished = finalScores
+        .filter(p => p.r3 != null && p.r4 != null)
+        .sort((a, b) => a.total - b.total)
+        .slice(0, 10);
+      if (!finished.length) return null;
+      // Pack the top-10 gids into the correct_answer field as a JSON array.
+      return JSON.stringify(finished.map(p => p.gid));
+    }
+    default:
+      return null;
+  }
+}
+
+// Score a single user's answer against a resolved question. Returns true /
+// false. Handles the player_pick case (correct_answer is a JSON array).
+function scoreCaddiesCallAnswer(question, userAnswer) {
+  if (!question.correct_answer || !userAnswer) return false;
+  if (question.kind === "top10_player_pick") {
+    try { return JSON.parse(question.correct_answer).includes(userAnswer); }
+    catch { return false; }
+  }
+  return question.correct_answer === userAnswer;
+}
+
+// Score all unscored questions for a major + rebuild per-user results rows.
+// Idempotent — re-running won't double-count.
+async function runCaddiesCallScoring(majorId) {
+  if (!pool) throw new Error("DB not configured");
+  const year = ccYearForMajor(majorId);
+  // 1. Resolve every unscored question.
+  const { rows: questions } = await pool.query(
+    `SELECT id, kind, options, resolver_data, correct_answer, scored_at
+       FROM caddies_call_questions
+      WHERE major_id = $1 AND year = $2`,
+    [majorId, year]
+  );
+  let resolvedCount = 0;
+  for (const q of questions) {
+    if (q.correct_answer) continue;
+    const answer = await resolveCaddiesCallQuestion({
+      id: q.id, kind: q.kind, options: q.options, resolver_data: q.resolver_data
+    }, majorId);
+    if (answer == null) continue;
+    await pool.query(
+      `UPDATE caddies_call_questions SET correct_answer = $1, scored_at = NOW(), updated_at = NOW()
+        WHERE id = $2`,
+      [answer, q.id]
+    );
+    resolvedCount++;
+  }
+  // 2. Rebuild per-user results.
+  const { rows: scoredQs } = await pool.query(
+    `SELECT id, kind, correct_answer FROM caddies_call_questions
+      WHERE major_id = $1 AND year = $2 AND correct_answer IS NOT NULL`,
+    [majorId, year]
+  );
+  if (!scoredQs.length) return { resolved: resolvedCount, usersScored: 0 };
+  const questionIds = scoredQs.map(q => q.id);
+  const { rows: allAnswers } = await pool.query(
+    `SELECT user_id, question_id, answer
+       FROM caddies_call_answers
+      WHERE question_id = ANY($1::bigint[])`,
+    [questionIds]
+  );
+  const qById = Object.fromEntries(scoredQs.map(q => [q.id, q]));
+  const byUser = {};
+  for (const a of allAnswers) {
+    const q = qById[a.question_id];
+    if (!q) continue;
+    if (!byUser[a.user_id]) byUser[a.user_id] = { correct: 0, answered: 0 };
+    byUser[a.user_id].answered += 1;
+    if (scoreCaddiesCallAnswer(q, a.answer)) byUser[a.user_id].correct += 1;
+  }
+  for (const userId of Object.keys(byUser)) {
+    const { correct, answered } = byUser[userId];
+    await pool.query(
+      `INSERT INTO caddies_call_results (user_id, major_id, year, correct, answered, scored_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       ON CONFLICT (user_id, major_id, year)
+       DO UPDATE SET correct = EXCLUDED.correct, answered = EXCLUDED.answered, scored_at = NOW()`,
+      [userId, majorId, year, correct, answered]
+    );
+  }
+  return { resolved: resolvedCount, usersScored: Object.keys(byUser).length };
+}
+
+// Admin-only: trigger scoring manually. Will be wired to the Sunday-night
+// scoring job in Phase 4 polish.
+app.post("/api/admin/caddies-call/:majorId/score", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  const { majorId } = req.params;
+  if (!MAJORS_META[majorId]) return res.status(404).json({ error: `unknown major: ${majorId}` });
+  try {
+    const result = await runCaddiesCallScoring(majorId);
+    res.json({ ok: true, ...result });
+  } catch (err) {
+    console.error("[POST admin/caddies-call/score] failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/me/caddies-call/summary — current user's lifetime Call Rate.
+app.get("/api/me/caddies-call/summary", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const { rows } = await pool.query(
+      `SELECT COALESCE(SUM(correct),0)::int AS correct,
+              COALESCE(SUM(answered),0)::int AS answered,
+              COUNT(*)::int AS majors_played
+         FROM caddies_call_results
+        WHERE user_id = $1`,
+      [req.user.id]
+    );
+    const r = rows[0];
+    res.json({
+      correct:      r.correct,
+      answered:     r.answered,
+      majorsPlayed: r.majors_played,
+      callRate:     r.answered > 0 ? Math.round((r.correct / r.answered) * 100) / 100 : null,
+    });
+  } catch (err) {
+    console.error("[GET me/caddies-call/summary] failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Admin-only: trigger the factory manually. Will become an automatic
+// cron-triggered run at picks-open Monday in Phase 3.
+app.post("/api/admin/caddies-call/:majorId/run-factory", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  const { majorId } = req.params;
+  if (!MAJORS_META[majorId]) return res.status(404).json({ error: `unknown major: ${majorId}` });
+  try {
+    const year = ccYearForMajor(majorId);
+    const result = await runCaddiesCallFactory(majorId, year);
+    res.json({ ok: true, majorId, year, questionCount: result.length });
+  } catch (err) {
+    console.error("[POST admin/caddies-call/run-factory] failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // Build a leaderboard response purely from SNAPSHOTS — used when DataGolf's
 // in-play has moved on to a different tournament but we want to serve the
