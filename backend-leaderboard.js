@@ -245,6 +245,51 @@ async function initSchema() {
     console.error("⚠  CC pre-flight migration failed:", err.message);
   }
 
+  // Pre-flight: notification tables. Same defensive treatment as CC —
+  // some prior migration is silently failing and these never get created,
+  // which breaks the entire email pipeline (test endpoint + scheduled
+  // notifications both query notification_log). Idempotent.
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS notification_prefs (
+        user_id        BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        picks_open     BOOLEAN NOT NULL DEFAULT true,
+        wed_reminder   BOOLEAN NOT NULL DEFAULT true,
+        round_wrap     BOOLEAN NOT NULL DEFAULT true,
+        mc_alert       BOOLEAN NOT NULL DEFAULT true,
+        sat_reminder   BOOLEAN NOT NULL DEFAULT true,
+        unsub_token    TEXT NOT NULL DEFAULT encode(gen_random_bytes(16), 'hex'),
+        updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS notification_log (
+        user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        kind       TEXT   NOT NULL,
+        major_id   TEXT   NOT NULL,
+        round      INT,
+        sent_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        message_id TEXT
+      )
+    `);
+    await pool.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_log_uniq
+        ON notification_log (user_id, kind, major_id, COALESCE(round, 0))
+    `);
+    await pool.query(`
+      CREATE INDEX IF NOT EXISTS idx_notification_log_user ON notification_log (user_id)
+    `);
+    // Seed default prefs (all-on) for any existing user without a row.
+    await pool.query(`
+      INSERT INTO notification_prefs (user_id)
+      SELECT u.id FROM users u
+       WHERE NOT EXISTS (SELECT 1 FROM notification_prefs np WHERE np.user_id = u.id)
+    `);
+    console.log("✓  notification_* tables ensured (pre-flight)");
+  } catch (err) {
+    console.error("⚠  notification pre-flight migration failed:", err.message);
+  }
+
   // Base tables (idempotent)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS leagues (
