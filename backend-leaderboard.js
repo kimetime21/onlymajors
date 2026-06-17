@@ -2535,29 +2535,47 @@ app.get("/api/tee-times/:majorId/:round", async (req, res) => {
       return res.json({ majorId, round, times: {}, source: "no-field-data" });
     }
     const field = Array.isArray(data.field) ? data.field : [];
-    // DataGolf has used multiple field-name conventions over time. Try a few
-    // common ones in priority order so we don't break when they tweak the
-    // schema. Each one matches a documented or observed naming pattern.
-    const keysToTry = [
-      `r${round}_teetime`,        // current documented format
-      `r${round}_tee_time`,       // alt with underscore
-      `round${round}_teetime`,    // legacy-ish
-      `tee_time_round_${round}`,  // verbose alt
-    ];
-    if (round === 1) keysToTry.push("teetime", "tee_time", "start_time");
-    const times = {};
-    let matchedKey = null;
-    let sampledKeys = null;
-    for (const p of field) {
-      let iso = null;
-      for (const k of keysToTry) {
-        if (p[k]) { iso = p[k]; if (!matchedKey) matchedKey = k; break; }
+    // DataGolf nests tee times in a `teetimes` field per player. Shape varies
+    // — sometimes an object keyed by round, sometimes an array. extractTeeTime
+    // tries every plausible structure so we're resilient if they tweak it.
+    const extractTeeTime = (p, r) => {
+      // Top-level fallbacks (some endpoints flatten them).
+      if (p[`r${r}_teetime`])  return p[`r${r}_teetime`];
+      if (p[`r${r}_tee_time`]) return p[`r${r}_tee_time`];
+      const tt = p.teetimes;
+      if (!tt) return null;
+      // String → just the R1 tee time
+      if (typeof tt === "string") return r === 1 ? tt : null;
+      // Array → try 1-indexed then 0-indexed
+      if (Array.isArray(tt)) {
+        return tt[r - 1] || tt[r] || null;
       }
+      // Object → try every key naming convention
+      if (typeof tt === "object") {
+        return tt[`r${r}`]
+            || tt[`round${r}`]
+            || tt[`round_${r}`]
+            || tt[r]
+            || tt[String(r)]
+            || tt[`r${r}_teetime`]
+            || null;
+      }
+      return null;
+    };
+    const times = {};
+    let sampleTeetimesShape = null;
+    for (const p of field) {
+      const iso = extractTeeTime(p, round);
       if (!iso) {
-        // Capture the first player's keys for debugging if we're getting
-        // empty results — surface them in the response so we can see what
-        // DataGolf actually returned without a separate debug endpoint.
-        if (!sampledKeys) sampledKeys = Object.keys(p).sort();
+        // Capture the first player's teetimes structure so we can see the
+        // exact shape if extraction still fails.
+        if (!sampleTeetimesShape && p.teetimes != null) {
+          sampleTeetimesShape = {
+            type: Array.isArray(p.teetimes) ? "array" : typeof p.teetimes,
+            value: p.teetimes,
+            playerName: p.player_name,
+          };
+        }
         continue;
       }
       const gid = matchGolferId(p.player_name) || `dg-${p.dg_id || NORMALIZE(p.player_name)}`;
@@ -2573,8 +2591,7 @@ app.get("/api/tee-times/:majorId/:round", async (req, res) => {
       majorId, round,
       eventName:  data.event_name || null,
       lastUpdated: data.last_updated || null,
-      matchedKey,                                   // which field name worked (debug)
-      sampledKeys: Object.keys(times).length === 0 ? sampledKeys : null,
+      sampleTeetimesShape: Object.keys(times).length === 0 ? sampleTeetimesShape : null,
       fieldSize:   field.length,
       times,
     });
