@@ -2535,13 +2535,31 @@ app.get("/api/tee-times/:majorId/:round", async (req, res) => {
       return res.json({ majorId, round, times: {}, source: "no-field-data" });
     }
     const field = Array.isArray(data.field) ? data.field : [];
-    // Field rows usually have shape: { dg_id, player_name, r1_teetime, r2_teetime, r3_teetime, r4_teetime, course? }.
-    // Falls back to teetime if round-specific isn't set (Thu R1 case).
-    const teeKey = `r${round}_teetime`;
+    // DataGolf has used multiple field-name conventions over time. Try a few
+    // common ones in priority order so we don't break when they tweak the
+    // schema. Each one matches a documented or observed naming pattern.
+    const keysToTry = [
+      `r${round}_teetime`,        // current documented format
+      `r${round}_tee_time`,       // alt with underscore
+      `round${round}_teetime`,    // legacy-ish
+      `tee_time_round_${round}`,  // verbose alt
+    ];
+    if (round === 1) keysToTry.push("teetime", "tee_time", "start_time");
     const times = {};
+    let matchedKey = null;
+    let sampledKeys = null;
     for (const p of field) {
-      const iso = p[teeKey] || (round === 1 ? p.teetime : null);
-      if (!iso) continue;
+      let iso = null;
+      for (const k of keysToTry) {
+        if (p[k]) { iso = p[k]; if (!matchedKey) matchedKey = k; break; }
+      }
+      if (!iso) {
+        // Capture the first player's keys for debugging if we're getting
+        // empty results — surface them in the response so we can see what
+        // DataGolf actually returned without a separate debug endpoint.
+        if (!sampledKeys) sampledKeys = Object.keys(p).sort();
+        continue;
+      }
       const gid = matchGolferId(p.player_name) || `dg-${p.dg_id || NORMALIZE(p.player_name)}`;
       const d = new Date(iso);
       if (Number.isNaN(d.getTime())) continue;
@@ -2555,6 +2573,9 @@ app.get("/api/tee-times/:majorId/:round", async (req, res) => {
       majorId, round,
       eventName:  data.event_name || null,
       lastUpdated: data.last_updated || null,
+      matchedKey,                                   // which field name worked (debug)
+      sampledKeys: Object.keys(times).length === 0 ? sampledKeys : null,
+      fieldSize:   field.length,
       times,
     });
   } catch (err) {
