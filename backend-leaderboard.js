@@ -3273,6 +3273,44 @@ app.get("/api/health", (req, res) => {
   });
 });
 
+// Diagnostic: what does DataGolf currently think is in-play, and does
+// its event_id match the one we have hardcoded? Used when the leaderboard
+// is showing empty during a major we KNOW is underway — almost always a
+// stale event_id mapping.
+app.get("/api/admin/datagolf-diag", async (req, res) => {
+  try {
+    const [inPlay, field] = await Promise.all([
+      fetchDG("/preds/in-play", { tour: "pga", dead_heat: "yes", odds_format: "percent" }).catch(e => ({ error: e.message })),
+      fetchDG("/field-updates", { tour: "pga" }).catch(e => ({ error: e.message })),
+    ]);
+    const inPlayPlayerCount = Array.isArray(inPlay?.data) ? inPlay.data.length
+                            : Array.isArray(inPlay) ? inPlay.length : 0;
+    const fieldPlayerCount  = Array.isArray(field?.field) ? field.field.length
+                            : Array.isArray(field?.data)  ? field.data.length : 0;
+    res.json({
+      expected: DG_EVENT_IDS,
+      inPlay: {
+        event_id:    inPlay?.event_id ?? inPlay?.eventId ?? null,
+        event_name:  inPlay?.event_name ?? null,
+        current_round: inPlay?.current_round ?? inPlay?.round ?? null,
+        last_updated: inPlay?.last_updated ?? null,
+        player_count: inPlayPlayerCount,
+        error: inPlay?.error,
+      },
+      fieldUpdates: {
+        event_id:   field?.event_id ?? field?.eventId ?? null,
+        event_name: field?.event_name ?? null,
+        last_updated: field?.last_updated ?? null,
+        player_count: fieldPlayerCount,
+        error: field?.error,
+      },
+    });
+  } catch (err) {
+    console.error("[datagolf-diag] failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/api/leaderboard/:majorId", async (req, res) => {
   const majorId = req.params.majorId;
   const eventId = DG_EVENT_IDS[majorId];
