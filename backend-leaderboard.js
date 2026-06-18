@@ -3283,26 +3283,37 @@ app.get("/api/admin/datagolf-diag", async (req, res) => {
       fetchDG("/preds/in-play", { tour: "pga", dead_heat: "yes", odds_format: "percent" }).catch(e => ({ error: e.message })),
       fetchDG("/field-updates", { tour: "pga" }).catch(e => ({ error: e.message })),
     ]);
-    const inPlayPlayerCount = Array.isArray(inPlay?.data) ? inPlay.data.length
-                            : Array.isArray(inPlay) ? inPlay.length : 0;
-    const fieldPlayerCount  = Array.isArray(field?.field) ? field.field.length
-                            : Array.isArray(field?.data)  ? field.data.length : 0;
+    const inPlayPlayers = Array.isArray(inPlay?.data) ? inPlay.data
+                        : Array.isArray(inPlay) ? inPlay : [];
+    const fieldPlayerCount = Array.isArray(field?.field) ? field.field.length
+                           : Array.isArray(field?.data)  ? field.data.length : 0;
+    // Sample one player to see what scoring fields DG is populating right now.
+    const sample = inPlayPlayers[0] || null;
+    const sampleSummary = sample ? {
+      player_name:   sample.player_name,
+      current_pos:   sample.current_pos ?? null,
+      current_score: sample.current_score ?? null,
+      thru:          sample.thru ?? null,
+      R1:            sample.R1 ?? sample.r1 ?? null,
+      keys:          Object.keys(sample),
+    } : null;
     res.json({
       expected: DG_EVENT_IDS,
       inPlay: {
-        event_id:    inPlay?.event_id ?? inPlay?.eventId ?? null,
-        event_name:  inPlay?.event_name ?? null,
+        event_id:     inPlay?.event_id ?? inPlay?.eventId ?? null,
+        event_name:   inPlay?.event_name ?? null,
         current_round: inPlay?.current_round ?? inPlay?.round ?? null,
         last_updated: inPlay?.last_updated ?? null,
-        player_count: inPlayPlayerCount,
-        error: inPlay?.error,
+        player_count: inPlayPlayers.length,
+        sample:       sampleSummary,
+        error:        inPlay?.error,
       },
       fieldUpdates: {
-        event_id:   field?.event_id ?? field?.eventId ?? null,
-        event_name: field?.event_name ?? null,
+        event_id:     field?.event_id ?? field?.eventId ?? null,
+        event_name:   field?.event_name ?? null,
         last_updated: field?.last_updated ?? null,
         player_count: fieldPlayerCount,
-        error: field?.error,
+        error:        field?.error,
       },
     });
   } catch (err) {
@@ -3331,10 +3342,33 @@ app.get("/api/leaderboard/:majorId", async (req, res) => {
     // Keep name maps warm regardless of which tournament in-play is showing.
     hydrateNameMaps(players);
 
-    // Detect if DataGolf's current in-play IS this major. Compare its event_id
-    // to our expected one. Be permissive about the field name.
+    // Detect if DataGolf's current in-play IS this major. Primary signal:
+    // in-play's own event_id field. Fallback signal: /field-updates says
+    // this major is "the current week" — useful when in-play hasn't flipped
+    // into live mode yet (early Thursday morning, no leader through 9 etc.)
+    // but the field roster is already loaded.
     const inPlayEventId = data?.event_id ?? data?.eventId ?? data?.event ?? null;
-    const isThisMajorLive = inPlayEventId != null && Number(inPlayEventId) === Number(eventId);
+    let isThisMajorLive = inPlayEventId != null && Number(inPlayEventId) === Number(eventId);
+    if (!isThisMajorLive && players.length >= 50) {
+      // Field-updates confirms which event DG considers current. If it's
+      // this major AND in-play has the full field with scoring fields
+      // present on at least some rows, accept it as live.
+      try {
+        const field = await cached("field-current", CACHE_TTL, () =>
+          fetchDG("/field-updates", { tour: "pga" }).catch(() => null)
+        );
+        const fieldEventId = field?.event_id ?? field?.eventId ?? null;
+        if (fieldEventId != null && Number(fieldEventId) === Number(eventId)) {
+          // Confirm at least one player has live-scoring fields (current_pos,
+          // current_score, thru, etc.). If yes, in-play has flipped.
+          const hasLiveFields = players.some(p =>
+            p.current_pos != null || p.current_score != null || p.thru != null ||
+            p.R1 != null || p.r1 != null
+          );
+          if (hasLiveFields) isThisMajorLive = true;
+        }
+      } catch (_) { /* swallow — fall through to historical */ }
+    }
 
     // Only snapshot when in-play IS this major. Otherwise we'd corrupt this
     // major's final R4 snapshot with a totally different tournament's data.
