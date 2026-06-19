@@ -1754,6 +1754,46 @@ app.put("/api/club-championship/picks/:majorId", requireAuth, async (req, res) =
   }
 });
 
+// Live-total helper for Club Championship standings. Builds a dg_id-keyed
+// money map from current SNAPSHOTS, then sums each entry's starters. Used
+// when the periodic scoring job hasn't populated the results table yet
+// (during active tournament play).
+function computeLiveCcStandings(entries) {
+  const sum = (starters, majorId) => {
+    let total = 0;
+    for (const gid of starters || []) {
+      if (!gid) continue;
+      const dgId = GID_TO_DGID.get(gid);
+      if (!dgId) continue;
+      const snaps = SNAPSHOTS[majorId]?.[dgId] || {};
+      // Prefer the latest round we have. finalMoney > projMoney.
+      const latest = snaps[4] || snaps[3] || snaps[2] || snaps[1];
+      if (!latest) continue;
+      total += latest.finalMoney ?? latest.projMoney ?? 0;
+    }
+    return total;
+  };
+  // Group by (majorId, user) — entries already filtered by major in callers.
+  const ranked = entries.map(e => ({
+    userId:   Number(e.user_id),
+    name:     e.display_name || `Member ${e.user_id}`,
+    starters: Array.isArray(e.starters) ? e.starters : [],
+    total:    sum(e.starters || [], e.major_id),
+    submittedAt: e.submitted_at,
+  })).sort((a, b) => {
+    if (b.total !== a.total) return b.total - a.total;
+    // Tie-break by earliest submission
+    return new Date(a.submittedAt).getTime() - new Date(b.submittedAt).getTime();
+  });
+  let rank = 0, prevTotal = null;
+  for (let i = 0; i < ranked.length; i++) {
+    if (ranked[i].total !== prevTotal) rank = i + 1;
+    ranked[i].rank = rank;
+    prevTotal = ranked[i].total;
+  }
+  return ranked;
+}
+
 app.get("/api/club-championship/standings/:majorId", requireAuth, async (req, res) => {
   if (!requireDb(res)) return;
   const { majorId } = req.params;
@@ -1761,7 +1801,7 @@ app.get("/api/club-championship/standings/:majorId", requireAuth, async (req, re
   try {
     const year = ccYear(majorId);
     // Top 10 with display info from users.
-    const { rows: top10 } = await pool.query(
+    let { rows: top10 } = await pool.query(
       `SELECT r.user_id, u.display_name, r.total, r.rank
          FROM club_championship_results r
          JOIN users u ON u.id = r.user_id
@@ -1770,6 +1810,27 @@ app.get("/api/club-championship/standings/:majorId", requireAuth, async (req, re
         LIMIT 10`,
       [majorId, year]
     );
+    // If the periodic scoring job hasn't populated results yet (active
+    // tournament), compute live totals from snapshots so per-person numbers
+    // update each refresh.
+    let liveStandings = null;
+    if (top10.length === 0) {
+      const { rows: liveEntries } = await pool.query(
+        `SELECT e.user_id, e.starters, e.submitted_at,
+                u.display_name, e.major_id
+           FROM club_championship_entries e
+           JOIN users u ON u.id = e.user_id
+          WHERE e.major_id = $1 AND e.year = $2`,
+        [majorId, year]
+      );
+      liveStandings = computeLiveCcStandings(liveEntries);
+      top10 = liveStandings.slice(0, 10).map(r => ({
+        user_id:      r.userId,
+        display_name: r.name,
+        total:        r.total,
+        rank:         r.rank,
+      }));
+    }
     // Caller's own row + field size.
     const { rows: mine } = await pool.query(
       `SELECT r.total, r.rank
@@ -1817,10 +1878,21 @@ app.get("/api/club-championship/standings/:majorId", requireAuth, async (req, re
           scorePrediction: r.score_prediction,
         };
       }),
-      you: mine.length ? {
-        total: Number(mine[0].total),
-        rank:  mine[0].rank == null ? null : Number(mine[0].rank),
-      } : null,
+      you: (() => {
+        // Use scored row if available, otherwise pull live total from the
+        // computed standings for this caller.
+        if (mine.length) {
+          return {
+            total: Number(mine[0].total),
+            rank:  mine[0].rank == null ? null : Number(mine[0].rank),
+          };
+        }
+        if (liveStandings) {
+          const youRow = liveStandings.find(r => r.userId === Number(req.user.id));
+          if (youRow) return { total: youRow.total, rank: youRow.rank };
+        }
+        return null;
+      })(),
     });
   } catch (err) {
     console.error("[GET cc standings] failed:", err);
