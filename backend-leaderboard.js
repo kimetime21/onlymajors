@@ -3435,6 +3435,28 @@ app.get("/api/admin/datagolf-diag", async (req, res) => {
         event_name:   field?.event_name ?? null,
         last_updated: field?.last_updated ?? null,
         player_count: fieldPlayerCount,
+        // Sample to verify am field shape on /field-updates
+        sample: (() => {
+          const list = Array.isArray(field?.field) ? field.field
+                     : Array.isArray(field?.data)  ? field.data : [];
+          const s = list[0];
+          if (!s) return null;
+          return {
+            player_name: s.player_name,
+            dg_id:       s.dg_id,
+            am:          s.am ?? null,
+            amateur:     s.amateur ?? null,
+            keys:        Object.keys(s),
+          };
+        })(),
+        // Count of amateurs found in field-updates
+        amateur_count: (() => {
+          const list = Array.isArray(field?.field) ? field.field
+                     : Array.isArray(field?.data)  ? field.data : [];
+          return list.filter(p =>
+            p.am === 1 || p.am === true || p.amateur === true || p.amateur === 1
+          ).length;
+        })(),
         error:        field?.error,
       },
     });
@@ -3471,25 +3493,37 @@ app.get("/api/leaderboard/:majorId", async (req, res) => {
     // but the field roster is already loaded.
     const inPlayEventId = data?.event_id ?? data?.eventId ?? data?.event ?? null;
     let isThisMajorLive = inPlayEventId != null && Number(inPlayEventId) === Number(eventId);
+
+    // Always pull field-updates (cached): gives us amateur status that
+    // /preds/in-play doesn't expose on Scratch+, plus an event_id fallback
+    // when in-play hasn't flipped to live mode yet.
+    let fieldData = null;
+    try {
+      fieldData = await cached("field-current", CACHE_TTL, () =>
+        fetchDG("/field-updates", { tour: "pga" }).catch(() => null)
+      );
+    } catch (_) { /* swallow */ }
+    const fieldList = Array.isArray(fieldData?.field) ? fieldData.field
+                    : Array.isArray(fieldData?.data)  ? fieldData.data : [];
+    const fieldAmateurs = {};
+    for (const fp of fieldList) {
+      if (fp?.dg_id == null) continue;
+      const isAm = fp.am === 1 || fp.am === true || fp.amateur === true || fp.amateur === 1;
+      if (isAm) fieldAmateurs[fp.dg_id] = true;
+    }
+
     if (!isThisMajorLive && players.length >= 50) {
       // Field-updates confirms which event DG considers current. If it's
       // this major AND in-play has the full field with scoring fields
       // present on at least some rows, accept it as live.
-      try {
-        const field = await cached("field-current", CACHE_TTL, () =>
-          fetchDG("/field-updates", { tour: "pga" }).catch(() => null)
+      const fieldEventId = fieldData?.event_id ?? fieldData?.eventId ?? null;
+      if (fieldEventId != null && Number(fieldEventId) === Number(eventId)) {
+        const hasLiveFields = players.some(p =>
+          p.current_pos != null || p.current_score != null || p.thru != null ||
+          p.R1 != null || p.r1 != null
         );
-        const fieldEventId = field?.event_id ?? field?.eventId ?? null;
-        if (fieldEventId != null && Number(fieldEventId) === Number(eventId)) {
-          // Confirm at least one player has live-scoring fields (current_pos,
-          // current_score, thru, etc.). If yes, in-play has flipped.
-          const hasLiveFields = players.some(p =>
-            p.current_pos != null || p.current_score != null || p.thru != null ||
-            p.R1 != null || p.r1 != null
-          );
-          if (hasLiveFields) isThisMajorLive = true;
-        }
-      } catch (_) { /* swallow — fall through to historical */ }
+        if (hasLiveFields) isThisMajorLive = true;
+      }
     }
 
     // Only snapshot when in-play IS this major. Otherwise we'd corrupt this
@@ -3528,9 +3562,11 @@ app.get("/api/leaderboard/:majorId", async (req, res) => {
           name:       prettyName(p.player_name || ""),
           country:    p.country || "",
           dg_id:      p.dg_id || null,
-          // Amateur flag — DataGolf marks amateurs with am=1 (or "true").
-          // Standard golf convention is to render "(a)" after their name.
-          amateur:    p.am === 1 || p.am === true || p.amateur === true,
+          // Amateur flag — primary source is /field-updates (where DG always
+          // includes am), fallback is /preds/in-play's own p.am (not present
+          // on Scratch+ tier). Standard golf convention: render "(a)" after.
+          amateur:    (p.dg_id != null && fieldAmateurs[p.dg_id] === true)
+                       || p.am === 1 || p.am === true || p.amateur === true,
           position:   isWD ? "WD" : isDQ ? "DQ" : pos,
           score:      typeof p.current_score === "number" ? p.current_score : null,
           thru:       p.thru ?? "",
