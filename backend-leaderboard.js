@@ -2363,6 +2363,95 @@ function prettyName(dgPlayerName) {
 // increments, the last value written is the end-of-previous-round value.
 const SNAPSHOTS = {};
 
+// ─────────────────────────────────────────────────────────────
+// Live-event tracking. PREV_LIVE[majorId][dg_id] holds the previous
+// fetch's snapshot of position/score/status for diffing. RECENT_EVENTS
+// is a ring buffer of the last EVENT_BUFFER_SIZE events per major.
+const PREV_LIVE = {};
+const RECENT_EVENTS = {};
+const EVENT_BUFFER_SIZE = 50;
+const MIN_POSITION_DELTA = 2;     // ≥ 2 spots to emit a climb/fall
+const MIN_PAYOUT_DELTA   = 25000; // ≥ $25K change to flag a money-significant move
+
+function parsePos(p) {
+  if (p == null || p === "") return null;
+  const s = String(p).toUpperCase();
+  if (s === "MC" || s === "CUT" || s === "WD" || s === "DQ") return null;
+  const m = s.match(/^T?(\d+)/);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+// Diff each player against the previous snapshot, emit structured events.
+// Called once per leaderboard fetch with the freshly built golfers object.
+function emitLiveEvents(majorId, golfers, prevAggregateLeader) {
+  PREV_LIVE[majorId] = PREV_LIVE[majorId] || {};
+  RECENT_EVENTS[majorId] = RECENT_EVENTS[majorId] || [];
+  const prev = PREV_LIVE[majorId];
+  const events = RECENT_EVENTS[majorId];
+  const now = Date.now();
+  const pushEvent = (e) => {
+    events.unshift({ ...e, ts: now });
+    if (events.length > EVENT_BUFFER_SIZE) events.length = EVENT_BUFFER_SIZE;
+  };
+  let newLeader = null;
+  let newLeaderScore = null;
+  for (const [gid, g] of Object.entries(golfers)) {
+    if (!g.dg_id) continue;
+    const prevP = prev[g.dg_id];
+    const newPos = parsePos(g.position);
+    if (newPos === 1) {
+      if (newLeader === null || (g.score != null && newLeaderScore != null && g.score < newLeaderScore)) {
+        newLeader = { gid, name: g.name, dgId: g.dg_id, score: g.score };
+        newLeaderScore = g.score;
+      }
+    }
+    if (prevP) {
+      const oldPos = parsePos(prevP.position);
+      const oldStatus = prevP.status;
+      const oldMoney = prevP.projMoney || 0;
+      const newMoney = g.projMoney || 0;
+      const moneyDelta = newMoney - oldMoney;
+      // WD detection
+      if (oldStatus === "made_cut" && g.status === "wd") {
+        pushEvent({ type: "withdrew", name: g.name, gid, dgId: g.dg_id });
+      }
+      // Missed cut detection (only meaningful R2+ when cut applies)
+      if (oldStatus === "made_cut" && g.status === "mc") {
+        pushEvent({ type: "missed_cut", name: g.name, gid, dgId: g.dg_id });
+      }
+      // Position movement (only for made_cut players)
+      if (g.status === "made_cut" && oldPos != null && newPos != null) {
+        const delta = oldPos - newPos; // positive = climbed
+        if (Math.abs(delta) >= MIN_POSITION_DELTA && Math.abs(moneyDelta) >= MIN_PAYOUT_DELTA) {
+          pushEvent({
+            type: delta > 0 ? "climb" : "fall",
+            name: g.name, gid, dgId: g.dg_id,
+            oldPos: prevP.position, newPos: g.position,
+            score: g.score, moneyDelta,
+          });
+        }
+      }
+    }
+    prev[g.dg_id] = {
+      position: g.position, status: g.status,
+      score: g.score, projMoney: g.projMoney,
+    };
+  }
+  // New sole leader event
+  if (newLeader && (!prevAggregateLeader || prevAggregateLeader.dgId !== newLeader.dgId)) {
+    const scoreFmt = newLeader.score == null ? ""
+                   : newLeader.score === 0  ? "E"
+                   : newLeader.score > 0    ? `+${newLeader.score}`
+                   : `${newLeader.score}`;
+    pushEvent({
+      type: "new_leader",
+      name: newLeader.name, gid: newLeader.gid, dgId: newLeader.dgId,
+      score: newLeader.score, scoreFmt,
+    });
+    PREV_LIVE[majorId].__leader = { dgId: newLeader.dgId, score: newLeader.score };
+  }
+}
+
 // dg_id → short id (reverse lookup for the stats endpoint)
 const DGID_TO_GID = new Map();
 // short id → dg_id
@@ -3632,6 +3721,15 @@ app.get("/api/leaderboard/:majorId", async (req, res) => {
       golfers = buildSnapshotLeaderboard(majorId);
     }
 
+    // Emit live events (position changes, MC, WD, leader changes) by diffing
+    // against the previous fetch. Stored in RECENT_EVENTS ring buffer.
+    if (isThisMajorLive) {
+      try {
+        const prevLeader = PREV_LIVE[majorId]?.__leader || null;
+        emitLiveEvents(majorId, golfers, prevLeader);
+      } catch (e) { console.warn("emitLiveEvents:", e.message); }
+    }
+
     res.json({
       tournamentName: isThisMajorLive ? (data?.event_name || null) : null,
       currentRound:   isThisMajorLive ? currentRound : null,
@@ -3643,6 +3741,45 @@ app.get("/api/leaderboard/:majorId", async (req, res) => {
     console.error(`leaderboard ${majorId}:`, err.message);
     res.status(502).json({ error: err.message });
   }
+});
+
+// Live event feed for the major. Optional ?leagueId scopes the events to
+// only golfers rostered by members of that league (your fantasy lineup
+// view). No leagueId → entire field (Club Championship view).
+app.get("/api/leaderboard/:majorId/events", async (req, res) => {
+  if (!requireDb(res)) return;
+  const { majorId } = req.params;
+  if (!DG_EVENT_IDS[majorId]) return res.status(404).json({ error: `unknown major: ${majorId}` });
+  const events = RECENT_EVENTS[majorId] || [];
+  const leagueId = req.query.leagueId ? Number(req.query.leagueId) : null;
+  let filtered = events;
+  if (leagueId) {
+    try {
+      const { rows } = await pool.query(
+        `SELECT starters, bench FROM picks WHERE league_id = $1 AND major_id = $2`,
+        [leagueId, majorId]
+      );
+      const rosterDgIds = new Set();
+      const rosterGids  = new Set();
+      for (const r of rows) {
+        const starters = Array.isArray(r.starters) ? r.starters : [];
+        const bench    = Array.isArray(r.bench)    ? r.bench    : [];
+        for (const gid of [...starters, ...bench].filter(Boolean)) {
+          rosterGids.add(gid);
+          const dgId = GID_TO_DGID.get(gid);
+          if (dgId) rosterDgIds.add(dgId);
+        }
+      }
+      filtered = events.filter(e =>
+        (e.dgId && rosterDgIds.has(e.dgId)) ||
+        (e.gid  && rosterGids.has(e.gid))
+      );
+    } catch (e) {
+      console.warn("event filter failed:", e.message);
+      filtered = events;
+    }
+  }
+  res.json({ majorId, leagueId, events: filtered.slice(0, 8) });
 });
 
 // ─────────────────────────────────────────────────────────────
