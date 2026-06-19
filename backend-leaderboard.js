@@ -3684,7 +3684,17 @@ app.get("/api/leaderboard/:majorId", async (req, res) => {
 
     const players = Array.isArray(data?.data) ? data.data
                   : Array.isArray(data) ? data : [];
-    const currentRound = data?.current_round || data?.round || null;
+    // DG's Scratch+ tier sometimes returns current_round=null even with a
+    // populated field. Infer from the field instead: highest R{N} with any
+    // recorded scores is the current round.
+    let currentRound = data?.current_round || data?.round || null;
+    if (currentRound == null && players.length > 0) {
+      const hasR = (r) => players.some(p => p[`R${r}`] != null || p[`r${r}`] != null);
+      if (hasR(4))      currentRound = 4;
+      else if (hasR(3)) currentRound = 3;
+      else if (hasR(2)) currentRound = 2;
+      else if (hasR(1)) currentRound = 1;
+    }
 
     // Keep name maps warm regardless of which tournament in-play is showing.
     hydrateNameMaps(players);
@@ -3879,7 +3889,16 @@ app.get("/api/stats/:majorId/:golferId", async (req, res) => {
     );
     const lbPlayers = Array.isArray(lbData?.data) ? lbData.data
                     : Array.isArray(lbData) ? lbData : [];
-    recordRoundSnapshotInPlay(majorId, lbData?.current_round || lbData?.round, lbPlayers);
+    // Same currentRound inference as the leaderboard endpoint.
+    let statsRound = lbData?.current_round || lbData?.round || null;
+    if (statsRound == null && lbPlayers.length > 0) {
+      const hasR = (r) => lbPlayers.some(p => p[`R${r}`] != null || p[`r${r}`] != null);
+      if (hasR(4))      statsRound = 4;
+      else if (hasR(3)) statsRound = 3;
+      else if (hasR(2)) statsRound = 2;
+      else if (hasR(1)) statsRound = 1;
+    }
+    recordRoundSnapshotInPlay(majorId, statsRound, lbPlayers);
     if (!dgId) dgId = GID_TO_DGID.get(golferId) || null;
     if (!dgId) return res.status(404).json({ error: `no dg_id resolved for ${golferId}` });
 
