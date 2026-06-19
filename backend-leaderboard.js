@@ -2178,6 +2178,46 @@ function expectedMoneyFromProbs(p, majorId) {
   return Math.round(expected);
 }
 
+// Position-based projector: "what would you cash if play stopped right now."
+// Sorts the active field by current_score, assigns sequential ranks (ties
+// share the sum of their slots' payouts), maps each player to their payout.
+// This is what members EXPECT — current standings drive current dollars —
+// versus DG's probabilistic model that weights skill/talent heavily.
+function buildPositionMoneyMap(playersInPlay, majorId) {
+  const tbl = MAJOR_PAYOUTS[majorId];
+  if (!tbl) return {};
+  const ranks = tbl.ranks;
+  const active = (playersInPlay || [])
+    .filter(p => {
+      if (p?.dg_id == null) return false;
+      const pos = String(p.current_pos || "").toUpperCase();
+      if (pos === "MC" || pos === "CUT" || pos === "WD" || pos === "DQ") return false;
+      if (p.make_cut === 0) return false;
+      return typeof p.current_score === "number";
+    })
+    .sort((a, b) => a.current_score - b.current_score);
+  const byDgId = {};
+  let rank = 1;
+  let i = 0;
+  while (i < active.length) {
+    const score = active[i].current_score;
+    let j = i;
+    while (j < active.length && active[j].current_score === score) j++;
+    const tied = j - i;
+    let totalPayout = 0;
+    for (let r = rank; r < rank + tied; r++) {
+      if (r <= ranks.length) totalPayout += ranks[r - 1];
+    }
+    const perPlayer = Math.round(totalPayout / tied);
+    for (let k = i; k < j; k++) {
+      byDgId[active[k].dg_id] = perPlayer;
+    }
+    rank += tied;
+    i = j;
+  }
+  return byDgId;
+}
+
 // ─────────────────────────────────────────────────────────────
 // Tiny in-memory cache
 // ─────────────────────────────────────────────────────────────
@@ -2378,6 +2418,8 @@ function recordRoundSnapshotInPlay(majorId, currentRound, players) {
   if (!currentRound || currentRound < 1 || currentRound > 4) return;
   SNAPSHOTS[majorId] = SNAPSHOTS[majorId] || {};
   const store = SNAPSHOTS[majorId];
+  // Build position-based money map for this snapshot pass.
+  const snapshotPosMoney = buildPositionMoneyMap(players, majorId);
 
   // Capture ALL completed rounds, not just the current one. DataGolf returns
   // R1..R4 strokes on each player, so we can backfill any rounds we missed.
@@ -2389,9 +2431,9 @@ function recordRoundSnapshotInPlay(majorId, currentRound, players) {
 
     // Snapshot the CURRENT round with everything we know now. When DG
     // doesn't supply prize_money_projected (Scratch+ tier on /preds/in-play),
-    // derive it from finish probabilities so snapshots aren't all null.
+    // use position-based "what would you cash if play stopped now" money.
     const dgProj = p.prize_money_projected ?? null;
-    const derivedProj = isMC ? 0 : (expectedMoneyFromProbs(p, majorId) ?? null);
+    const derivedProj = isMC ? 0 : (snapshotPosMoney[p.dg_id] ?? 0);
     store[p.dg_id][currentRound] = {
       projMoney:  dgProj != null ? dgProj : derivedProj,
       finalMoney: p.final_money ?? null,
@@ -3535,6 +3577,8 @@ app.get("/api/leaderboard/:majorId", async (req, res) => {
     let golfers;
     if (isThisMajorLive) {
       // LIVE MODE — build from in-play + snapshot money overlay
+      // Build position-based money map once for the whole field.
+      const positionMoney = buildPositionMoneyMap(players, majorId);
       golfers = {};
       for (const p of players) {
         const matchedGid = matchGolferId(p.player_name);
@@ -3548,13 +3592,14 @@ app.get("/api/leaderboard/:majorId", async (req, res) => {
         const status = isWD ? "wd" : isDQ ? "dfl" : isMC ? "mc" : "made_cut";
         const moneyRounds = p.dg_id ? getPlayerRounds(majorId, p.dg_id) : { r1: null, r2: null, r3: null, r4: null };
 
-        // Money projections. DataGolf's Scratch+ tier doesn't expose
-        // prize_money_projected on /preds/in-play (June 2026), but it DOES
-        // expose finish probabilities. We derive expected money from those
-        // when DG doesn't supply a direct projection. MC/WD/DQ get $0.
+        // Money projections. Members want "what would you cash if play
+        // stopped right now" — that's position-based, not probability-based.
+        // Position map handles ties (group payouts split evenly across the
+        // tied slots). MC/WD/DQ → $0. If DG ever surfaces real projections
+        // on this tier, those take precedence.
         const dgProj = p.prize_money_projected ?? p.proj_money ?? null;
         const computedProj = (status === "made_cut")
-          ? expectedMoneyFromProbs(p, majorId)
+          ? (positionMoney[p.dg_id] ?? 0)
           : 0;
         const projMoney = dgProj != null ? dgProj : computedProj;
         golfers[gid] = {
