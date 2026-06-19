@@ -2060,6 +2060,124 @@ const MAJOR_PAR = {
   open:    70,  // Royal Birkdale (2026)
 };
 
+// Per-major payout tables (1-indexed by finish position). Used to derive
+// projected money from DataGolf's win/top-N probabilities when /preds/in-play
+// doesn't expose `prize_money_projected` directly (Scratch Plus tier as of
+// June 2026). Top 70 + ties earn at every major. Numbers based on 2025
+// purses scaled up modestly for 2026.
+const MAJOR_PAYOUTS = {
+  usopen: {
+    purse: 21500000,
+    ranks: [
+      4300000, 2320000, 1460000, 1020000,  848000,
+       753000,  700000,  619000,  557000,  505000,
+       463000,  433000,  405000,  379000,  358000,
+       341000,  327000,  314000,  302000,  290000,
+       279000,  268000,  257000,  246000,  235000,
+       225000,  215000,  207000,  200000,  193000,
+       186000,  180000,  174000,  168000,  162000,
+       156000,  151000,  146000,  141000,  137000,
+       133000,  129000,  125000,  121000,  117000,
+       113000,  110000,  107000,  104000,  101000,
+        99000,   97000,   95000,   93000,   91000,
+        89500,   88000,   86500,   85000,   83500,
+        82000,   80500,   79000,   77500,   76000,
+        74500,   73000,   71500,   70000,   68500,
+    ],
+  },
+  open: {
+    purse: 17000000,
+    ranks: [
+      3100000, 1759000, 1128000,  878000,  706000,
+       614000,  521000,  430000,  393000,  365000,
+       337000,  319000,  305000,  287000,  273000,
+       259000,  246000,  235000,  223000,  212000,
+       201000,  192000,  183000,  174000,  165000,
+       156000,  148000,  142000,  136000,  130000,
+       124000,  119000,  114000,  109000,  105000,
+       101000,   97000,   93000,   89000,   85000,
+        82000,   79000,   76000,   73000,   71000,
+        69000,   67000,   65000,   63000,   62000,
+        61000,   60000,   59000,   58000,   57000,
+        56000,   55000,   54500,   54000,   53500,
+        53000,   52500,   52000,   51500,   51000,
+        50500,   50000,   49500,   49000,   48500,
+    ],
+  },
+  masters: {
+    purse: 21000000,
+    ranks: [
+      3780000, 2268000, 1428000,  1008000,  840000,
+       756000,  703500,  651000,  609000,  567000,
+       525000,  483000,  441000,  399000,  378000,
+       357000,  336000,  315000,  294000,  273000,
+       252000,  235000,  219000,  205000,  191000,
+       177000,  166000,  159000,  153000,  148000,
+       143000,  138000,  133000,  128000,  124000,
+       120000,  117000,  114000,  111000,  108000,
+       105000,  102000,   99000,   96000,   93000,
+        90000,   87000,   84000,   81000,   78000,
+        75000,   73500,   72000,   70500,   69000,
+        68000,   67000,   66000,   65000,   64000,
+    ],
+  },
+  pga: {
+    purse: 19000000,
+    ranks: [
+      3420000, 2052000, 1292000,  912000,  760000,
+       684000,  636500,  589000,  551000,  513000,
+       475000,  437000,  399000,  361000,  342000,
+       323000,  304000,  285000,  266000,  247000,
+       228000,  213000,  198000,  185000,  172000,
+       159000,  150000,  144000,  138000,  133000,
+       128000,  124000,  120000,  116000,  112000,
+       108000,  105000,  102000,   99000,   96000,
+        93000,   90000,   87000,   84000,   81000,
+        78000,   75000,   72000,   69000,   66000,
+    ],
+  },
+};
+
+// Average payout across a finish-position band — used by the probability →
+// money projector. Bands match DG's exposed thresholds (top_5, top_10, top_20).
+function avgPayoutBand(ranks, fromRank, toRank) {
+  let sum = 0, n = 0;
+  for (let i = fromRank; i <= toRank && i <= ranks.length; i++) {
+    sum += ranks[i-1];
+    n++;
+  }
+  return n > 0 ? sum / n : 0;
+}
+// Expected prize money from DG's probabilities. DG's odds-format=percent
+// returns these as percentages (0-100), but defensively handle 0-1 too.
+function expectedMoneyFromProbs(p, majorId) {
+  const tbl = MAJOR_PAYOUTS[majorId];
+  if (!tbl) return null;
+  const norm = (v) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return 0;
+    return n > 1 ? n / 100 : n;
+  };
+  const win  = norm(p.win);
+  const t5   = norm(p.top_5);
+  const t10  = norm(p.top_10);
+  const t20  = norm(p.top_20);
+  const cut  = norm(p.make_cut);
+  const ranks = tbl.ranks;
+  // Probability bands (cumulative top_N includes everything inside it).
+  const pBand2_5    = Math.max(0, t5  - win);
+  const pBand6_10   = Math.max(0, t10 - t5);
+  const pBand11_20  = Math.max(0, t20 - t10);
+  const pBand21_cut = Math.max(0, cut - t20);
+  const expected =
+    win        * (ranks[0] || 0) +
+    pBand2_5   * avgPayoutBand(ranks,  2,  5) +
+    pBand6_10  * avgPayoutBand(ranks,  6, 10) +
+    pBand11_20 * avgPayoutBand(ranks, 11, 20) +
+    pBand21_cut* avgPayoutBand(ranks, 21, ranks.length);
+  return Math.round(expected);
+}
+
 // ─────────────────────────────────────────────────────────────
 // Tiny in-memory cache
 // ─────────────────────────────────────────────────────────────
@@ -2269,9 +2387,13 @@ function recordRoundSnapshotInPlay(majorId, currentRound, players) {
     const pos = typeof p.current_pos === "number" ? `${p.current_pos}` : (p.current_pos || "");
     const isMC = pos === "MC" || pos === "CUT" || p.make_cut === 0;
 
-    // Snapshot the CURRENT round with everything we know now.
+    // Snapshot the CURRENT round with everything we know now. When DG
+    // doesn't supply prize_money_projected (Scratch+ tier on /preds/in-play),
+    // derive it from finish probabilities so snapshots aren't all null.
+    const dgProj = p.prize_money_projected ?? null;
+    const derivedProj = isMC ? 0 : (expectedMoneyFromProbs(p, majorId) ?? null);
     store[p.dg_id][currentRound] = {
-      projMoney:  p.prize_money_projected ?? null,
+      projMoney:  dgProj != null ? dgProj : derivedProj,
       finalMoney: p.final_money ?? null,
       score:      typeof p.current_score === "number" ? p.current_score : null,
       roundScore: p[`R${currentRound}`] ?? p[`r${currentRound}`] ?? null,
@@ -3392,6 +3514,15 @@ app.get("/api/leaderboard/:majorId", async (req, res) => {
         const status = isWD ? "wd" : isDQ ? "dfl" : isMC ? "mc" : "made_cut";
         const moneyRounds = p.dg_id ? getPlayerRounds(majorId, p.dg_id) : { r1: null, r2: null, r3: null, r4: null };
 
+        // Money projections. DataGolf's Scratch+ tier doesn't expose
+        // prize_money_projected on /preds/in-play (June 2026), but it DOES
+        // expose finish probabilities. We derive expected money from those
+        // when DG doesn't supply a direct projection. MC/WD/DQ get $0.
+        const dgProj = p.prize_money_projected ?? p.proj_money ?? null;
+        const computedProj = (status === "made_cut")
+          ? expectedMoneyFromProbs(p, majorId)
+          : 0;
+        const projMoney = dgProj != null ? dgProj : computedProj;
         golfers[gid] = {
           matched:    !!matchedGid,
           name:       prettyName(p.player_name || ""),
@@ -3404,7 +3535,8 @@ app.get("/api/leaderboard/:majorId", async (req, res) => {
           score:      typeof p.current_score === "number" ? p.current_score : null,
           thru:       p.thru ?? "",
           status,
-          projMoney:  p.prize_money_projected ?? p.proj_money ?? null,
+          projMoney,
+          projMoneySource: dgProj != null ? "datagolf" : "derived",
           finalMoney: p.final_money ?? null,
           r1: moneyRounds.r1, r2: moneyRounds.r2, r3: moneyRounds.r3, r4: moneyRounds.r4,
           r1Score: p.R1 ?? p.r1 ?? null,
