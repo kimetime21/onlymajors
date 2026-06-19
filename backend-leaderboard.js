@@ -1842,6 +1842,19 @@ app.get("/api/club-championship/standings/:majorId", requireAuth, async (req, re
       `SELECT COUNT(*)::int AS n FROM club_championship_entries WHERE major_id = $1 AND year = $2`,
       [majorId, year]
     );
+    // Pull every entry's starters once — used to attach picks to the top10
+    // rows so the frontend can expand a row and see what someone picked.
+    // Cheap because club_championship_entries is small (≤ Clubhouse size).
+    const { rows: starterRows } = await pool.query(
+      `SELECT user_id, starters FROM club_championship_entries
+        WHERE major_id = $1 AND year = $2`,
+      [majorId, year]
+    );
+    const startersByUser = {};
+    for (const r of starterRows) {
+      const arr = Array.isArray(r.starters) ? r.starters : [];
+      startersByUser[Number(r.user_id)] = arr.filter(Boolean);
+    }
     // Submitters list (everyone who has entered). Ordered by submitted_at so
     // earliest entries appear first — also the tie-break order for the score
     // prediction. Pre-tournament this is what the averages widget displays;
@@ -1859,10 +1872,11 @@ app.get("/api/club-championship/standings/:majorId", requireAuth, async (req, re
       majorId, year,
       fieldSize: countRows[0]?.n || 0,
       top10: top10.map(r => ({
-        userId: Number(r.user_id),
-        name:   r.display_name || `Member ${r.user_id}`,
-        total:  Number(r.total),
-        rank:   r.rank == null ? null : Number(r.rank),
+        userId:   Number(r.user_id),
+        name:     r.display_name || `Member ${r.user_id}`,
+        total:    Number(r.total),
+        rank:     r.rank == null ? null : Number(r.rank),
+        starters: startersByUser[Number(r.user_id)] || [],
       })),
       submitters: submittersRows.map(r => {
         const first = r.first_name?.trim() || null;
