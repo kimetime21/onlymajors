@@ -1939,6 +1939,70 @@ app.get("/api/club-championship/archive", async (req, res) => {
   }
 });
 
+// Admin-only: finalize a completed Club Championship. Reads entries,
+// computes live standings from snapshots, writes champion + runners-up
+// to the archive table. Idempotent — ON CONFLICT UPDATE.
+app.post("/api/admin/club-championship/finalize/:majorId", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  const { majorId } = req.params;
+  if (!MAJORS_META[majorId]) return res.status(404).json({ error: `unknown major: ${majorId}` });
+  try {
+    const year = ccYear(majorId);
+    const { rows: entries } = await pool.query(
+      `SELECT e.user_id, e.starters, e.submitted_at, u.display_name, u.first_name, u.last_name, e.major_id
+         FROM club_championship_entries e
+         JOIN users u ON u.id = e.user_id
+        WHERE e.major_id = $1 AND e.year = $2`,
+      [majorId, year]
+    );
+    if (entries.length === 0) {
+      return res.status(400).json({ error: "no entries to archive" });
+    }
+    const ranked = computeLiveCcStandings(entries);
+    const winner = ranked[0];
+    if (!winner) return res.status(400).json({ error: "unable to compute champion" });
+    // "First L." display for the archive to match the standings widget.
+    const nameFor = (userId) => {
+      const e = entries.find(x => Number(x.user_id) === userId);
+      const f = e?.first_name?.trim(), l = e?.last_name?.trim();
+      if (f && l) return `${f} ${l[0].toUpperCase()}.`;
+      return e?.display_name || `Member ${userId}`;
+    };
+    const runnersUp = ranked.slice(1, 10).map(r => ({
+      userId: r.userId, name: nameFor(r.userId), total: r.total, rank: r.rank,
+    }));
+    await pool.query(
+      `INSERT INTO club_championship_archive
+         (major_id, year, champion_user_id, champion_name, champion_total, runners_up, finalized_at)
+         VALUES ($1, $2, $3, $4, $5, $6::jsonb, NOW())
+       ON CONFLICT (major_id, year) DO UPDATE
+         SET champion_user_id = EXCLUDED.champion_user_id,
+             champion_name    = EXCLUDED.champion_name,
+             champion_total   = EXCLUDED.champion_total,
+             runners_up       = EXCLUDED.runners_up,
+             finalized_at     = NOW()`,
+      [majorId, year, winner.userId, nameFor(winner.userId), winner.total, JSON.stringify(runnersUp)]
+    );
+    // Also snapshot into results table so scored-mode standings queries
+    // return the same numbers post-finalization.
+    for (const r of ranked) {
+      await pool.query(
+        `INSERT INTO club_championship_results (user_id, major_id, year, total, rank)
+           VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (user_id, major_id, year) DO UPDATE
+           SET total = EXCLUDED.total, rank = EXCLUDED.rank`,
+        [r.userId, majorId, year, r.total, r.rank]
+      ).catch(e => console.warn("cc results upsert:", e.message));
+    }
+    res.json({ ok: true, majorId, year, champion: {
+      userId: winner.userId, name: nameFor(winner.userId), total: winner.total,
+    }, runnersUp });
+  } catch (err) {
+    console.error("[POST cc finalize] failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── /api/me/notifications ─────────────────────────────────────────────────
 // GET → current preference toggles for the authed user.
 // PUT → upsert; body keys default to the existing value if omitted.
@@ -2982,9 +3046,12 @@ function ccYearForMajor(majorId) {
   return new Date().getFullYear();
 }
 
-app.get("/api/caddies-call/:majorId", requireAuth, async (req, res) => {
+app.get("/api/caddies-call/:majorId", requireAuth, async (req, res, next) => {
   if (!requireDb(res)) return;
   const { majorId } = req.params;
+  // Skip reserved sub-paths so sibling routes handle them (Express matches
+  // in definition order; /hall-of-fame would otherwise match :majorId first).
+  if (majorId === "hall-of-fame") return next();
   if (!MAJORS_META[majorId]) return res.status(404).json({ error: `unknown major: ${majorId}` });
   try {
     const year = ccYearForMajor(majorId);
