@@ -3210,16 +3210,24 @@ async function resolveCaddiesCallQuestion(question, majorId) {
   const allEntries = Object.entries(snap);
   if (allEntries.length === 0) return null;
   // Helper: per-player total stroke counts and finish positions from snapshot.
+  // SNAPSHOTS[majorId][dgId] is nested by round: { 1: {roundScore, position,
+  // status, ...}, 2: {...}, 3: {...}, 4: {...} }. Read the roundScore from
+  // each round object. Position/status come from the latest available round.
   const finalScores = allEntries
     .map(([dgIdStr, s]) => {
       const dgId = Number(dgIdStr);
       const gid  = DGID_TO_GID.get(dgId) || `dg-${dgId}`;
-      const r1   = s.r1_score ?? null;
-      const r2   = s.r2_score ?? null;
-      const r3   = s.r3_score ?? null;
-      const r4   = s.r4_score ?? null;
+      const r1   = s[1]?.roundScore ?? null;
+      const r2   = s[2]?.roundScore ?? null;
+      const r3   = s[3]?.roundScore ?? null;
+      const r4   = s[4]?.roundScore ?? null;
       const total = [r1, r2, r3, r4].filter(x => typeof x === "number").reduce((a, b) => a + b, 0);
-      return { dgId, gid, r1, r2, r3, r4, total, finalPosition: s.position ?? null, status: s.status || "ok" };
+      const latest = s[4] || s[3] || s[2] || s[1] || {};
+      return {
+        dgId, gid, r1, r2, r3, r4, total,
+        finalPosition: latest.position ?? null,
+        status: latest.status || "ok",
+      };
     })
     .filter(p => p.r1 != null && p.r2 != null);
   switch (question.kind) {
