@@ -1914,6 +1914,36 @@ app.get("/api/club-championship/standings/:majorId", requireAuth, async (req, re
   }
 });
 
+// Current user's Club Championship career summary — avg, PR, wins,
+// majors played. Read from club_championship_results (finalize populates).
+app.get("/api/me/club-championship/summary", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const { rows } = await pool.query(
+      `SELECT
+         COALESCE(AVG(total), 0)::bigint  AS avg_total,
+         COALESCE(MAX(total), 0)::bigint  AS best_finish,
+         COUNT(DISTINCT major_id)::int    AS majors_played,
+         COUNT(*) FILTER (WHERE rank = 1)::int AS wins,
+         MIN(rank) AS best_rank
+         FROM club_championship_results
+        WHERE user_id = $1`,
+      [req.user.id]
+    );
+    const r = rows[0] || {};
+    res.json({
+      avgTotal:     Number(r.avg_total || 0),
+      bestFinish:   Number(r.best_finish || 0),
+      majorsPlayed: r.majors_played || 0,
+      wins:         r.wins || 0,
+      bestRank:     r.best_rank == null ? null : Number(r.best_rank),
+    });
+  } catch (err) {
+    console.error("[GET me/cc summary] failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Top-10 members by career average across all Club Championships they've
 // entered. Uses club_championship_results (populated by finalize). Sorted
 // by avg desc; tie-break by total earnings then majors played.
