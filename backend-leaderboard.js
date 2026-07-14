@@ -1914,6 +1914,50 @@ app.get("/api/club-championship/standings/:majorId", requireAuth, async (req, re
   }
 });
 
+// Top-10 members by career average across all Club Championships they've
+// entered. Uses club_championship_results (populated by finalize). Sorted
+// by avg desc; tie-break by total earnings then majors played.
+app.get("/api/club-championship/averages", async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const { rows } = await pool.query(
+      `SELECT r.user_id,
+              u.first_name, u.last_name, u.display_name,
+              AVG(r.total)::bigint     AS avg_total,
+              SUM(r.total)::bigint     AS total_earnings,
+              COUNT(DISTINCT r.major_id)::int AS majors_played,
+              MAX(r.total)::bigint     AS best_finish,
+              MIN(r.rank)::int         AS best_rank
+         FROM club_championship_results r
+         JOIN users u ON u.id = r.user_id
+        GROUP BY r.user_id, u.first_name, u.last_name, u.display_name
+        HAVING COUNT(DISTINCT r.major_id) >= 1
+        ORDER BY AVG(r.total) DESC, SUM(r.total) DESC
+        LIMIT 10`
+    );
+    const fmtName = (r) => {
+      const f = r.first_name?.trim(), l = r.last_name?.trim();
+      if (f && l) return `${f} ${l[0].toUpperCase()}.`;
+      return r.display_name || `Member ${r.user_id}`;
+    };
+    res.json({
+      top10: rows.map((r, i) => ({
+        rank:          i + 1,
+        userId:        Number(r.user_id),
+        name:          fmtName(r),
+        avgTotal:      Number(r.avg_total),
+        totalEarnings: Number(r.total_earnings),
+        majorsPlayed:  r.majors_played,
+        bestFinish:    Number(r.best_finish),
+        bestRank:      r.best_rank,
+      })),
+    });
+  } catch (err) {
+    console.error("[GET cc averages] failed:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get("/api/club-championship/archive", async (req, res) => {
   if (!requireDb(res)) return;
   try {
