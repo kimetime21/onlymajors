@@ -2199,6 +2199,102 @@ app.get("/api/admin/email-status", async (req, res) => {
   }
 });
 
+// Render an email template to HTML for preview in the browser. Doesn't
+// send anything — just returns the exact HTML a member would receive.
+// Example: /api/admin/email-preview?kind=picks_open&majorId=open
+app.get("/api/admin/email-preview", async (req, res) => {
+  const kind    = String(req.query.kind || "picks_open");
+  const majorId = String(req.query.majorId || "open");
+  const meta    = MAJORS_META[majorId];
+  if (!meta) return res.status(404).send(`unknown major: ${majorId}`);
+  const major = { id: majorId, ...meta };
+  const fakeUser = {
+    email: "preview@onlymajors.com",
+    displayName: req.query.name || "Preview User",
+  };
+  try {
+    let html;
+    // Each renderer builds its own layoutArgs then calls emailHtml() to
+    // wrap in the shared template. We mirror the send* functions but skip
+    // the actual Resend call — just capture the HTML.
+    switch (kind) {
+      case "picks_open": {
+        const ctaUrl = `${FRONTEND_URL}/?utm_source=email&utm_campaign=picks_open&utm_content=${major.id}`;
+        html = emailHtml({
+          preheader:  `Picks for ${major.name} are open — make yours.`,
+          heading:    `Picks open: ${major.short}`,
+          intro:      `The field is set for <strong>${major.name}</strong> at ${major.course}. Lock in your four starters and two bench before first tee on ${major.teeTimeLabel}.`,
+          ctaLabel:   "Make your picks",
+          ctaUrl,
+          bodyHtml:   "",
+          footerNote: "You're getting this because Picks Open notifications are on. Manage in Settings.",
+        });
+        break;
+      }
+      case "wed_reminder": {
+        const ctaUrl = `${FRONTEND_URL}/?utm_source=email&utm_campaign=wed_reminder&utm_content=${major.id}`;
+        html = emailHtml({
+          preheader:  `R1 tees off tomorrow — last call for ${major.short} picks.`,
+          heading:    `${major.short} picks lock tomorrow`,
+          intro:      `First tee at <strong>${major.course}</strong> is ${major.teeTimeLabel} — about <strong>~14 hours</strong> away. Your roster is still missing 2 starters and 1 bench.`,
+          ctaLabel:   "Finish your picks",
+          ctaUrl,
+          bodyHtml:   "",
+          footerNote: "Wednesday reminders only fire when your roster is incomplete. Manage in Settings.",
+        });
+        break;
+      }
+      case "round_wrap": {
+        const round = Number(req.query.round) || 2;
+        const ctaUrl = `${FRONTEND_URL}/?utm_source=email&utm_campaign=round_wrap&utm_content=${major.id}`;
+        html = emailHtml({
+          preheader:  `${major.short} R${round} in the books — your Money List update.`,
+          heading:    `R${round} wrap · ${major.short}`,
+          intro:      `Round ${round} at <strong>${major.course}</strong> is complete. Here's how your team stacks up${round === 2 ? " after the cut" : ""}.`,
+          ctaLabel:   "Open the Money List",
+          ctaUrl,
+          bodyHtml:   `<p style="margin:12px 0 0;">Your team: <strong>$1,432,596</strong> projected · rank 7 of 14</p>`,
+          footerNote: "Round wrap digests fire after each round completes. Manage in Settings.",
+        });
+        break;
+      }
+      case "sat_reminder": {
+        const ctaUrl = `${FRONTEND_URL}/?utm_source=email&utm_campaign=sat_reminder&utm_content=${major.id}`;
+        html = emailHtml({
+          preheader:  `Last chance to sub before Sunday tees off.`,
+          heading:    `Final subs · ${major.short}`,
+          intro:      `R3 is live. Any sub-outs you want to make have to happen before Sunday's first tee — after that, your starters are locked for the trophy round.`,
+          ctaLabel:   "Review my roster",
+          ctaUrl,
+          bodyHtml:   "",
+          footerNote: "Saturday reminders fire only when you have bench players to swap. Manage in Settings.",
+        });
+        break;
+      }
+      case "password_reset": {
+        const ctaUrl = `${FRONTEND_URL}/reset-password?token=preview-token`;
+        html = emailHtml({
+          preheader:  "Reset your OnlyMajors password.",
+          heading:    "Password reset",
+          intro:      "You (or someone using your email) requested a password reset. The link below expires in 1 hour.",
+          ctaLabel:   "Reset password",
+          ctaUrl,
+          bodyHtml:   `<p style="margin:12px 0 0;font-size:12px;color:#666;">If you didn't request this, ignore this email — nothing changes.</p>`,
+          footerNote: null,
+        });
+        break;
+      }
+      default:
+        return res.status(400).send(`unknown kind: ${kind}. Valid: picks_open, wed_reminder, round_wrap, sat_reminder, password_reset`);
+    }
+    res.set("Content-Type", "text/html; charset=utf-8");
+    res.send(html);
+  } catch (err) {
+    console.error("[email-preview] failed:", err);
+    res.status(500).send(err.message);
+  }
+});
+
 // Admin-only test endpoint to verify the email pipeline end-to-end.
 // Call from any logged-in browser via the dev console or curl:
 //   curl -X POST https://api.onlymajors.com/api/admin/test-email \
