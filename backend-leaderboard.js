@@ -1228,14 +1228,17 @@ async function checkPicksOpenForMajor(majorId) {
     const reserved = await reserveNotification({ userId: u.id, kind: "picks_open", majorId });
     if (!reserved) continue;
     try {
-      // Position brief: cumulative SEASON standings (mirrors the site's
-      // Money List) + career CC line + tournament-week weather.
-      const seasonBlock     = await buildLeagueSeasonStandingsBlock(u.id, {
-        label: `Season standings · your leagues`,
-      });
+      // Position brief: per-major recap of the just-completed major
+      // (round_snapshots has full live data for majors we've played through).
+      // Plus career CC line + tournament-week weather forecast.
+      const priorLeagueBlock = prevMajorId
+        ? await buildLeagueStandingsBlock(u.id, prevMajorId, {
+            label: `${MAJORS_META[prevMajorId]?.short} recap · your standings`,
+          })
+        : "";
       const caddieCallBlock = await buildCaddieCallBlock(u.id, majorId);
       const weatherBlock    = await buildWeatherBlock(majorId);
-      const positionBrief = `${seasonBlock || ""}${weatherBlock || ""}${caddieCallBlock || ""}`;
+      const positionBrief = `${priorLeagueBlock || ""}${weatherBlock || ""}${caddieCallBlock || ""}`;
       const { id } = await sendPicksOpenEmail({ email: u.email, displayName: u.display_name }, { id: majorId, ...meta }, positionBrief);
       if (id) {
         await pool.query(
@@ -2637,9 +2640,14 @@ app.get("/api/admin/email-preview", async (req, res) => {
         // if userId isn't provided.
         const userId = req.query.userId ? Number(req.query.userId) : null;
         if (userId && Number.isFinite(userId)) {
-          const seasonBlock     = await buildLeagueSeasonStandingsBlock(userId, {
-            label: `Season standings · your leagues`,
-          });
+          const majorOrder = ["masters","pga","usopen","open"];
+          const idx = majorOrder.indexOf(major.id);
+          const prevMajorId = idx > 0 ? majorOrder[idx - 1] : null;
+          const priorLeagueBlock = prevMajorId
+            ? await buildLeagueStandingsBlock(userId, prevMajorId, {
+                label: `${MAJORS_META[prevMajorId]?.short} recap · your standings`,
+              })
+            : "";
           const weatherBlock    = await buildWeatherBlock(major.id);
           const caddieCallBlock = await buildCaddieCallBlock(userId, major.id);
           const courseBlock = `
@@ -2657,7 +2665,7 @@ app.get("/api/admin/email-preview", async (req, res) => {
             intro:      `The field is set for <strong>${major.name}</strong> at ${major.course}. Lock in your four starters and two bench before first tee on ${major.teeTimeLabel}.`,
             ctaLabel:   "Make your picks",
             ctaUrl,
-            bodyHtml:   `${courseBlock}${seasonBlock || ""}${weatherBlock || ""}${caddieCallBlock || ""}`,
+            bodyHtml:   `${courseBlock}${priorLeagueBlock || ""}${weatherBlock || ""}${caddieCallBlock || ""}`,
             footerNote: "You're getting this because Picks Open notifications are on. Manage in Settings.",
           });
           break;
@@ -2812,12 +2820,17 @@ app.post("/api/admin/self-send", requireAuth, async (req, res) => {
     if (!user?.email) return res.status(400).json({ error: "no email on caller" });
     let result;
     if (kind === "picks_open") {
-      const seasonBlock     = await buildLeagueSeasonStandingsBlock(user.id, {
-        label: `Season standings · your leagues`,
-      });
+      const majorOrder = ["masters","pga","usopen","open"];
+      const idx = majorOrder.indexOf(majorId);
+      const prevMajorId = idx > 0 ? majorOrder[idx - 1] : null;
+      const priorLeagueBlock = prevMajorId
+        ? await buildLeagueStandingsBlock(user.id, prevMajorId, {
+            label: `${MAJORS_META[prevMajorId]?.short} recap · your standings`,
+          })
+        : "";
       const caddieCallBlock = await buildCaddieCallBlock(user.id, majorId);
       const weatherBlock    = await buildWeatherBlock(majorId);
-      const brief = `${seasonBlock || ""}${weatherBlock || ""}${caddieCallBlock || ""}`;
+      const brief = `${priorLeagueBlock || ""}${weatherBlock || ""}${caddieCallBlock || ""}`;
       result = await sendPicksOpenEmail(
         { email: user.email, displayName: user.display_name }, major, brief);
     } else if (kind === "round_wrap") {
