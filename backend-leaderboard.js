@@ -1552,14 +1552,45 @@ function renderClubChampBlock({ rank, fieldSize, total, roster, round }) {
 // Each returns "" when it has nothing to render so the email layout stays
 // clean. Called from round_wrap + picks_open to enrich each digest.
 
-// Sum a team's earnings for a given major from persisted snapshots.
-function teamTotalForMajor(starters, majorId) {
+// Sum a team's earnings for a given major. Reads persisted snapshots from
+// the round_snapshots DB table so it works even when in-memory SNAPSHOTS
+// is cold (Railway restart, new backend instance, etc.). Falls back to
+// in-memory if the DB is unavailable.
+async function teamTotalForMajor(starters, majorId) {
+  if (!starters?.length) return 0;
+  // Resolve each gid → dg_id. GID_TO_DGID map may be cold; if a gid comes
+  // in synthetic "dg-12345" form we can pull the dgId straight from it.
+  const dgIds = [];
+  for (const gid of starters) {
+    if (!gid) continue;
+    if (typeof gid === "string" && gid.startsWith("dg-")) {
+      const n = parseInt(gid.slice(3), 10);
+      if (!isNaN(n)) dgIds.push(n);
+      continue;
+    }
+    const n = GID_TO_DGID.get(gid);
+    if (n) dgIds.push(n);
+  }
+  if (dgIds.length === 0) return 0;
+  // Preferred path: query the persistent snapshot table.
+  if (pool) {
+    try {
+      const { rows } = await pool.query(
+        `SELECT dg_id, MAX(COALESCE(final_money, proj_money)) AS money
+           FROM round_snapshots
+          WHERE major_id = $1 AND dg_id = ANY($2::bigint[])
+          GROUP BY dg_id`,
+        [majorId, dgIds]
+      );
+      let total = 0;
+      for (const r of rows) total += Number(r.money) || 0;
+      if (total > 0) return total;
+    } catch (_) { /* fall through to in-memory */ }
+  }
+  // Fallback: in-memory SNAPSHOTS.
   const snaps = SNAPSHOTS[majorId] || {};
   let total = 0;
-  for (const gid of starters || []) {
-    if (!gid) continue;
-    const dgId = GID_TO_DGID.get(gid);
-    if (!dgId) continue;
+  for (const dgId of dgIds) {
     const s = snaps[dgId] || {};
     const latest = s[4] || s[3] || s[2] || s[1];
     if (!latest) continue;
@@ -1573,18 +1604,23 @@ function teamTotalForMajor(starters, majorId) {
 async function buildLeagueStandingsBlock(userId, majorId, opts = {}) {
   const label = opts.label || `${MAJORS_META[majorId]?.short || majorId} standings`;
   try {
-    // 1. Every league the user is in that includes this major.
+    // 1. Every league the user is in that includes this major, plus the
+    //    user's own display_name / member number for legacy team-id lookup.
     const { rows: myLeagues } = await pool.query(
-      `SELECT l.id, l.name, lm.team_id AS my_team_id
+      `SELECT l.id, l.name,
+              lm.team_id AS my_team_id,
+              u.display_name, u.first_name, u.member_number
          FROM leagues l
          JOIN league_members lm ON lm.league_id = l.id
+         JOIN users u ON u.id = lm.user_id
         WHERE lm.user_id = $1
           AND (l.included_majors IS NULL OR l.included_majors ? $2)`,
       [userId, majorId]
     );
     if (myLeagues.length === 0) return "";
-    // 2. For each league, pull all teams' picks for this major, sum totals,
-    //    rank, extract this user's row.
+    // 2. For each league, pull all teams' picks, sum totals, rank. Then
+    //    identify the caller's row via a multi-format lookup: try lm.team_id,
+    //    lg{id}-u{userId} synthetic, lowercase first-name, lowercase display.
     const perLeague = [];
     for (const lg of myLeagues) {
       const { rows: picks } = await pool.query(
@@ -1592,19 +1628,27 @@ async function buildLeagueStandingsBlock(userId, majorId, opts = {}) {
         [lg.id, majorId]
       );
       if (picks.length === 0) continue;
-      const ranked = picks
-        .map(p => ({
-          teamId: p.team_id,
-          total:  teamTotalForMajor(Array.isArray(p.starters) ? p.starters : [], majorId),
-        }))
-        .sort((a, b) => b.total - a.total);
+      const ranked = [];
+      for (const p of picks) {
+        const total = await teamTotalForMajor(
+          Array.isArray(p.starters) ? p.starters : [], majorId);
+        ranked.push({ teamId: p.team_id, total });
+      }
+      ranked.sort((a, b) => b.total - a.total);
       let rank = 0, prev = null;
       ranked.forEach((r, i) => {
         if (r.total !== prev) rank = i + 1;
         r.rank = rank;
         prev = r.total;
       });
-      const me = ranked.find(r => r.teamId === lg.my_team_id);
+      // Multi-format matcher: legacy Experts uses lowercased first-name
+      // ("austin"), user-created leagues use "lg{N}-u{userId}" synthetic.
+      const candidates = new Set();
+      if (lg.my_team_id)                             candidates.add(String(lg.my_team_id).toLowerCase());
+      candidates.add(`lg${lg.id}-u${userId}`.toLowerCase());
+      if (lg.first_name)                              candidates.add(lg.first_name.toLowerCase().trim());
+      if (lg.display_name)                            candidates.add(lg.display_name.toLowerCase().trim().split(/\s+/)[0]);
+      const me = ranked.find(r => r.teamId && candidates.has(String(r.teamId).toLowerCase()));
       if (!me) continue;
       perLeague.push({
         leagueName: lg.name,
