@@ -1651,15 +1651,25 @@ async function runNotificationSweep() {
   }
 }
 
-// Admin endpoint to fire the sweep on demand (useful for testing).
+// Admin endpoint to fire the sweep on demand. Accepts optional ?majorId=X
+// query param to scope to a single major (avoids Railway timeout when
+// sending to many members × 4 majors × 4 check types × Resend latency).
+// Every check wrapped in try/catch so one failure returns partial results
+// instead of 500'ing the whole response.
 app.post("/api/admin/notifications/sweep", requireAuth, async (req, res) => {
   const results = {};
-  for (const majorId of Object.keys(MAJORS_META)) {
+  const only = req.query.majorId ? [req.query.majorId] : Object.keys(MAJORS_META);
+  const guard = async (fn) => {
+    try { return await fn(); }
+    catch (e) { return { error: e.message }; }
+  };
+  for (const majorId of only) {
+    if (!MAJORS_META[majorId]) { results[majorId] = { error: "unknown major" }; continue; }
     results[majorId] = {
-      picks_open:   await checkPicksOpenForMajor(majorId),
-      wed_reminder: await checkWedReminderForMajor(majorId),
-      round_wrap:   await checkRoundWrapForMajor(majorId),
-      sat_reminder: await checkSatReminderForMajor(majorId),
+      picks_open:   await guard(() => checkPicksOpenForMajor(majorId)),
+      wed_reminder: await guard(() => checkWedReminderForMajor(majorId)),
+      round_wrap:   await guard(() => checkRoundWrapForMajor(majorId)),
+      sat_reminder: await guard(() => checkSatReminderForMajor(majorId)),
     };
   }
   res.json({ ok: true, results });
