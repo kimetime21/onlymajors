@@ -965,7 +965,15 @@ function emailHtml({ preheader = "", heading, intro, bodyHtml = "", ctaLabel, ct
       <td align="center" style="padding:40px 16px;">
         <table role="presentation" width="560" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.white};border-radius:14px;max-width:560px;width:100%;box-shadow:0 1px 3px rgba(43,69,53,0.06),0 8px 24px rgba(43,69,53,0.06);overflow:hidden;">
           <tr>
-            <td style="background:${BRAND.creamSoft};padding:28px 32px 22px;text-align:center;border-bottom:1px solid ${BRAND.rule};">
+            <td style="background:${BRAND.creamSoft};padding:24px 32px 22px;text-align:center;border-bottom:1px solid ${BRAND.rule};">
+              <div style="margin:0 auto 10px;line-height:0;">
+                <svg xmlns="http://www.w3.org/2000/svg" width="52" height="52" viewBox="0 0 56 56" style="display:inline-block;vertical-align:middle;">
+                  <circle cx="28" cy="28" r="26" fill="${BRAND.green}" stroke="${BRAND.greenInk}" stroke-width="1"/>
+                  <path d="M6 34 Q28 26 50 34 L50 46 Q28 42 6 46 Z" fill="${BRAND.greenInk}" opacity="0.55"/>
+                  <line x1="20" y1="12" x2="20" y2="42" stroke="${BRAND.cream}" stroke-width="1.6" stroke-linecap="round"/>
+                  <path d="M20 14 L36 18 L20 22 Z" fill="${BRAND.cream}"/>
+                </svg>
+              </div>
               <div style="color:${BRAND.green};font-size:22px;font-weight:800;letter-spacing:-0.02em;line-height:1;">OnlyMajors</div>
               <div style="color:${BRAND.dim};font-size:10px;letter-spacing:0.22em;text-transform:uppercase;margin-top:6px;">Fantasy golf when it counts</div>
             </td>
@@ -1128,15 +1136,9 @@ async function reserveNotification({ userId, kind, majorId, round = null, messag
 //   - user belongs to at least one league that includes this major
 //   - user's picks_open preference is true
 // Idempotency is guaranteed by the UNIQUE constraint on notification_log.
-async function sendPicksOpenEmail(user, major) {
+async function sendPicksOpenEmail(user, major, positionBrief = "") {
   const ctaUrl = `${FRONTEND_URL}/?utm_source=email&utm_campaign=picks_open&utm_content=${major.id}`;
-  const layoutArgs = {
-    preheader:  `Picks for ${major.name} are open — make yours.`,
-    heading:    `Picks open: ${major.short}`,
-    intro:      `The field is set for <strong>${major.name}</strong> at ${major.course}. Lock in your four starters and two bench before first tee on ${major.teeTimeLabel}.`,
-    ctaLabel:   "Make your picks",
-    ctaUrl,
-    bodyHtml: `
+  const courseBlock = `
       <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:8px 0 0;background:${BRAND.creamSoft};border:1px solid ${BRAND.rule};border-radius:8px;">
         <tr>
           <td style="padding:14px 16px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
@@ -1146,7 +1148,14 @@ async function sendPicksOpenEmail(user, major) {
             <div style="color:${BRAND.ink};font-size:14px;font-weight:600;margin-top:2px;">${major.teeTimeLabel}</div>
           </td>
         </tr>
-      </table>`,
+      </table>`;
+  const layoutArgs = {
+    preheader:  `Picks for ${major.name} are open — make yours.`,
+    heading:    `Picks open: ${major.short}`,
+    intro:      `The field is set for <strong>${major.name}</strong> at ${major.course}. Lock in your four starters and two bench before first tee on ${major.teeTimeLabel}.`,
+    ctaLabel:   "Make your picks",
+    ctaUrl,
+    bodyHtml:   `${courseBlock}${positionBrief || ""}`,
     footerNote: "You're receiving this because Picks Open notifications are on. Manage in Settings.",
   };
   return sendEmail({
@@ -1186,11 +1195,27 @@ async function checkPicksOpenForMajor(majorId) {
   );
 
   const results = { sent: 0, failed: 0, total: recipients.length };
+  // Which major was the most-recently-completed? Used to give members
+  // context on where they stand going into this new picks window.
+  const majorOrder = ["masters", "pga", "usopen", "open"];
+  const idx = majorOrder.indexOf(majorId);
+  const prevMajorId = idx > 0 ? majorOrder[idx - 1] : null;
   for (const u of recipients) {
     const reserved = await reserveNotification({ userId: u.id, kind: "picks_open", majorId });
     if (!reserved) continue;
     try {
-      const { id } = await sendPicksOpenEmail({ email: u.email, displayName: u.display_name }, { id: majorId, ...meta });
+      // Position brief: standings from the previous major + career CC line +
+      // tournament-week weather forecast (Open-Meteo, free public API).
+      // Gives members context on how they're doing before locking in picks.
+      const priorLeagueBlock = prevMajorId
+        ? await buildLeagueStandingsBlock(u.id, prevMajorId, {
+            label: `Coming off ${MAJORS_META[prevMajorId]?.short} · your standings`,
+          })
+        : "";
+      const caddieCallBlock = await buildCaddieCallBlock(u.id, majorId);
+      const weatherBlock    = await buildWeatherBlock(majorId);
+      const positionBrief = `${priorLeagueBlock || ""}${weatherBlock || ""}${caddieCallBlock || ""}`;
+      const { id } = await sendPicksOpenEmail({ email: u.email, displayName: u.display_name }, { id: majorId, ...meta }, positionBrief);
       if (id) {
         await pool.query(
           `UPDATE notification_log SET message_id = $1
@@ -1370,13 +1395,12 @@ async function checkRoundWrapForMajor(majorId) {
   );
   const results = { sent: 0, failed: 0, total: recipients.length, round: triggerRound };
   for (const u of recipients) {
-    // Build a per-league summary line (stub for now — we have enough hooks
-    // in the codebase to flesh this out later when standings logic moves to
-    // backend; for v1 the digest is a clean "see the Leaderboard" funnel.)
-    const leagueLines = `
-      <p style="color:${BRAND.body};font-size:14px;line-height:1.55;margin:0 0 12px;">
-        Round ${triggerRound} wrapped. Open the Leaderboard to see how your roster moved, and check the Money List for where you stand across the season.
-      </p>`;
+    // Rich per-league standings — real rank + total for each of the user's
+    // leagues that include this major. Replaces the earlier "see the
+    // Leaderboard" stub with actionable data.
+    const leagueLines = await buildLeagueStandingsBlock(u.id, majorId, {
+      label: `${meta.short} standings · your leagues`,
+    });
     // MC alert: if this is R2 and the user has MC starters, prepend a callout.
     let mcAlertHtml = "";
     if (triggerRound === 2) {
@@ -1389,7 +1413,9 @@ async function checkRoundWrapForMajor(majorId) {
       // enrolled. Returns "" today (feature-flagged off until enrollment
       // backend ships, task #153).
       const clubChampBlock = await buildClubChampBlock(u.id, majorId, triggerRound);
-      const { id } = await sendRoundWrapEmail({ email: u.email, displayName: u.display_name }, { id: majorId, ...meta }, triggerRound, leagueLines, mcAlertHtml, clubChampBlock);
+      const caddieCallBlock = await buildCaddieCallBlock(u.id, majorId);
+      const enrichedBody = `${leagueLines || ""}${clubChampBlock || ""}${caddieCallBlock || ""}`;
+      const { id } = await sendRoundWrapEmail({ email: u.email, displayName: u.display_name }, { id: majorId, ...meta }, triggerRound, enrichedBody, mcAlertHtml, "");
       if (id) {
         await pool.query(
           `UPDATE notification_log SET message_id = $1
@@ -1496,6 +1522,228 @@ function renderClubChampBlock({ rank, fieldSize, total, roster, round }) {
         </table>
       </td></tr>
     </table>`;
+}
+
+// ── Rich email content blocks ────────────────────────────────────────────
+// Each returns "" when it has nothing to render so the email layout stays
+// clean. Called from round_wrap + picks_open to enrich each digest.
+
+// Sum a team's earnings for a given major from persisted snapshots.
+function teamTotalForMajor(starters, majorId) {
+  const snaps = SNAPSHOTS[majorId] || {};
+  let total = 0;
+  for (const gid of starters || []) {
+    if (!gid) continue;
+    const dgId = GID_TO_DGID.get(gid);
+    if (!dgId) continue;
+    const s = snaps[dgId] || {};
+    const latest = s[4] || s[3] || s[2] || s[1];
+    if (!latest) continue;
+    total += latest.finalMoney ?? latest.projMoney ?? 0;
+  }
+  return total;
+}
+
+// Per-league standings for this user for a single major. Returns HTML with
+// one row per league the user belongs to that includes this major.
+async function buildLeagueStandingsBlock(userId, majorId, opts = {}) {
+  const label = opts.label || `${MAJORS_META[majorId]?.short || majorId} standings`;
+  try {
+    // 1. Every league the user is in that includes this major.
+    const { rows: myLeagues } = await pool.query(
+      `SELECT l.id, l.name, lm.team_id AS my_team_id
+         FROM leagues l
+         JOIN league_members lm ON lm.league_id = l.id
+        WHERE lm.user_id = $1
+          AND (l.included_majors IS NULL OR l.included_majors ? $2)`,
+      [userId, majorId]
+    );
+    if (myLeagues.length === 0) return "";
+    // 2. For each league, pull all teams' picks for this major, sum totals,
+    //    rank, extract this user's row.
+    const perLeague = [];
+    for (const lg of myLeagues) {
+      const { rows: picks } = await pool.query(
+        `SELECT team_id, starters FROM picks WHERE league_id = $1 AND major_id = $2`,
+        [lg.id, majorId]
+      );
+      if (picks.length === 0) continue;
+      const ranked = picks
+        .map(p => ({
+          teamId: p.team_id,
+          total:  teamTotalForMajor(Array.isArray(p.starters) ? p.starters : [], majorId),
+        }))
+        .sort((a, b) => b.total - a.total);
+      let rank = 0, prev = null;
+      ranked.forEach((r, i) => {
+        if (r.total !== prev) rank = i + 1;
+        r.rank = rank;
+        prev = r.total;
+      });
+      const me = ranked.find(r => r.teamId === lg.my_team_id);
+      if (!me) continue;
+      perLeague.push({
+        leagueName: lg.name,
+        rank:       me.rank,
+        total:      me.total,
+        fieldSize:  ranked.length,
+        leader:     ranked[0],
+        behind:     me.rank === 1 ? 0 : (ranked[0].total - me.total),
+      });
+    }
+    if (perLeague.length === 0) return "";
+    const fmtM = (n) => n >= 1e6 ? `$${(n/1e6).toFixed(2)}M` : `$${Math.round(n/1000)}K`;
+    const rows = perLeague.map(l => `
+      <tr>
+        <td style="padding:6px 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+          <span style="color:${BRAND.ink};font-size:13px;font-weight:600;">${l.leagueName}</span>
+          <span style="color:${BRAND.dim};font-size:11px;margin-left:8px;">#${l.rank} of ${l.fieldSize}</span>
+        </td>
+        <td style="padding:6px 0;text-align:right;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+          <span style="color:${BRAND.ink};font-size:13px;font-weight:700;">${fmtM(l.total)}</span>
+          ${l.rank === 1
+            ? `<span style="color:${BRAND.gold || '#8b6c00'};font-size:11px;margin-left:6px;">Leading</span>`
+            : `<span style="color:${BRAND.dim};font-size:11px;margin-left:6px;">${fmtM(l.behind)} back</span>`}
+        </td>
+      </tr>`).join("");
+    return `
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:18px 0 0;background:${BRAND.creamSoft};border:1px solid ${BRAND.rule};border-radius:8px;">
+        <tr><td style="padding:14px 16px;">
+          <div style="color:${BRAND.dim};font-size:10px;text-transform:uppercase;letter-spacing:0.18em;font-weight:600;">${label}</div>
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-top:6px;">
+            ${rows}
+          </table>
+        </td></tr>
+      </table>`;
+  } catch (err) {
+    console.error("[league_standings_block] failed:", err.message);
+    return "";
+  }
+}
+
+// Venue coordinates for tournament-week weather forecast (Open-Meteo).
+// Free API, no key required. Add new venues here when the calendar rolls.
+const VENUE_COORDS = {
+  masters: { lat: 33.502, lon: -82.023, tz: "America/New_York" },
+  pga:     { lat: 40.013, lon: -75.360, tz: "America/New_York" },
+  usopen:  { lat: 40.898, lon: -72.464, tz: "America/New_York" },
+  open:    { lat: 53.635, lon: -3.030,  tz: "Europe/London"    },
+};
+
+// Fetch a tournament-week weather forecast from Open-Meteo and render an
+// HTML card with one row per round (R1-R4). Returns "" on any failure so
+// the email still renders cleanly.
+async function buildWeatherBlock(majorId) {
+  const meta   = MAJORS_META[majorId];
+  const coords = VENUE_COORDS[majorId];
+  if (!meta?.rounds || !coords) return "";
+  try {
+    const roundDates = [1, 2, 3, 4].map(r => {
+      const d = new Date(meta.rounds[`r${r}`]);
+      return d.toISOString().slice(0, 10); // YYYY-MM-DD
+    });
+    const startDate = roundDates[0];
+    const endDate   = roundDates[3];
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${coords.lat}&longitude=${coords.lon}` +
+                `&daily=temperature_2m_max,temperature_2m_min,precipitation_probability_max,windspeed_10m_max,weathercode` +
+                `&temperature_unit=fahrenheit&windspeed_unit=mph&timezone=${encodeURIComponent(coords.tz)}` +
+                `&start_date=${startDate}&end_date=${endDate}`;
+    const resp = await fetch(url);
+    if (!resp.ok) return "";
+    const data = await resp.json();
+    const daily = data?.daily;
+    if (!daily?.time?.length) return "";
+    // Weather code → short label. Open-Meteo WMO codes.
+    const codeLabel = (c) => {
+      if (c === 0) return "Clear";
+      if (c <= 3) return "Cloudy";
+      if (c <= 48) return "Fog";
+      if (c <= 57) return "Drizzle";
+      if (c <= 67) return "Rain";
+      if (c <= 77) return "Snow";
+      if (c <= 82) return "Showers";
+      if (c <= 99) return "Storms";
+      return "—";
+    };
+    const rows = daily.time.map((dateStr, i) => {
+      const round = i + 1;
+      const hi   = Math.round(daily.temperature_2m_max?.[i] ?? 0);
+      const lo   = Math.round(daily.temperature_2m_min?.[i] ?? 0);
+      const wind = Math.round(daily.windspeed_10m_max?.[i] ?? 0);
+      const rain = Math.round(daily.precipitation_probability_max?.[i] ?? 0);
+      const cond = codeLabel(daily.weathercode?.[i]);
+      return `
+        <tr>
+          <td style="padding:6px 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+            <span style="color:${BRAND.ink};font-size:13px;font-weight:600;">R${round}</span>
+            <span style="color:${BRAND.dim};font-size:11px;margin-left:8px;">${cond}</span>
+          </td>
+          <td style="padding:6px 0;text-align:right;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+            <span style="color:${BRAND.ink};font-size:13px;font-weight:600;">${hi}°/${lo}°F</span>
+            <span style="color:${BRAND.dim};font-size:11px;margin-left:8px;">${wind} mph · ${rain}%</span>
+          </td>
+        </tr>`;
+    }).join("");
+    return `
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:18px 0 0;background:${BRAND.creamSoft};border:1px solid ${BRAND.rule};border-radius:8px;">
+        <tr><td style="padding:14px 16px;">
+          <div style="color:${BRAND.dim};font-size:10px;text-transform:uppercase;letter-spacing:0.18em;font-weight:600;">Tournament-week weather · ${meta.course}</div>
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-top:6px;">
+            ${rows}
+          </table>
+          <div style="margin-top:10px;color:${BRAND.dim};font-size:11px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+            Hi/Lo · max wind · precip chance
+          </div>
+        </td></tr>
+      </table>`;
+  } catch (err) {
+    console.error("[weather_block] failed:", err.message);
+    return "";
+  }
+}
+
+// Caddie's Call status block. Shows current-major answered count + career
+// call rate. Renders whether or not the user is in the middle of a card.
+async function buildCaddieCallBlock(userId, majorId) {
+  try {
+    const year = ccYearForMajor(majorId);
+    // Current-major status
+    const { rows: cur } = await pool.query(`
+      SELECT COUNT(a.answer)::int AS answered,
+             COUNT(*) FILTER (WHERE q.correct_answer IS NOT NULL AND q.correct_answer = a.answer)::int AS correct_so_far
+        FROM caddies_call_questions q
+        LEFT JOIN caddies_call_answers a ON a.question_id = q.id AND a.user_id = $1
+       WHERE q.major_id = $2 AND q.year = $3`,
+      [userId, majorId, year]);
+    // Career
+    const { rows: career } = await pool.query(`
+      SELECT COALESCE(SUM(correct),0)::int AS correct,
+             COALESCE(SUM(answered),0)::int AS answered
+        FROM caddies_call_results WHERE user_id = $1`,
+      [userId]);
+    const curAnswered = cur[0]?.answered || 0;
+    const careerCorrect = career[0]?.correct || 0;
+    const careerAnswered = career[0]?.answered || 0;
+    const rate = careerAnswered > 0 ? Math.round((careerCorrect / careerAnswered) * 100) : null;
+    const majorShort = MAJORS_META[majorId]?.short || majorId;
+    const currentLine = curAnswered > 0
+      ? `${curAnswered}/11 answered for ${majorShort}`
+      : `No card submitted for ${majorShort}`;
+    const careerLine = careerAnswered > 0
+      ? `${careerCorrect}/${careerAnswered} career · ${rate}% Call Rate`
+      : `No career calls scored yet`;
+    return `
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:18px 0 0;background:${BRAND.creamSoft};border:1px solid ${BRAND.rule};border-radius:8px;">
+        <tr><td style="padding:14px 16px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+          <div style="color:${BRAND.dim};font-size:10px;text-transform:uppercase;letter-spacing:0.18em;font-weight:600;">Caddie's Call</div>
+          <div style="margin-top:4px;color:${BRAND.ink};font-size:13px;font-weight:600;">${currentLine}</div>
+          <div style="margin-top:2px;color:${BRAND.dim};font-size:12px;">${careerLine}</div>
+        </td></tr>
+      </table>`;
+  } catch (err) {
+    console.error("[caddie_call_block] failed:", err.message);
+    return "";
+  }
 }
 
 // MC alert block — piggybacks on the R2 round-wrap. Returns "" if the user
@@ -2220,13 +2468,44 @@ app.get("/api/admin/email-preview", async (req, res) => {
     switch (kind) {
       case "picks_open": {
         const ctaUrl = `${FRONTEND_URL}/?utm_source=email&utm_campaign=picks_open&utm_content=${major.id}`;
+        // Mock position brief + LIVE weather fetch for the target major.
+        // Real send uses buildLeagueStandingsBlock + buildWeatherBlock — the
+        // preview shows those blocks with representative mock/live data.
+        const weatherBlock = await buildWeatherBlock(major.id);
+        const mockBrief = `
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:18px 0 0;background:${BRAND.creamSoft};border:1px solid ${BRAND.rule};border-radius:8px;">
+            <tr><td style="padding:14px 16px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+              <div style="color:${BRAND.dim};font-size:10px;text-transform:uppercase;letter-spacing:0.18em;font-weight:600;">Coming off U.S. Open · your standings</div>
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-top:6px;">
+                <tr><td style="padding:6px 0;"><span style="color:${BRAND.ink};font-size:13px;font-weight:600;">Experts League</span><span style="color:${BRAND.dim};font-size:11px;margin-left:8px;">#4 of 5</span></td><td style="padding:6px 0;text-align:right;"><span style="color:${BRAND.ink};font-size:13px;font-weight:700;">$1.43M</span><span style="color:${BRAND.dim};font-size:11px;margin-left:6px;">$700K back</span></td></tr>
+                <tr><td style="padding:6px 0;"><span style="color:${BRAND.ink};font-size:13px;font-weight:600;">Keim Boys</span><span style="color:${BRAND.dim};font-size:11px;margin-left:8px;">#5 of 6</span></td><td style="padding:6px 0;text-align:right;"><span style="color:${BRAND.ink};font-size:13px;font-weight:700;">$1.43M</span><span style="color:${BRAND.dim};font-size:11px;margin-left:6px;">$1.1M back</span></td></tr>
+              </table>
+            </td></tr>
+          </table>
+          ${weatherBlock || ""}
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:18px 0 0;background:${BRAND.creamSoft};border:1px solid ${BRAND.rule};border-radius:8px;">
+            <tr><td style="padding:14px 16px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+              <div style="color:${BRAND.dim};font-size:10px;text-transform:uppercase;letter-spacing:0.18em;font-weight:600;">Caddie's Call</div>
+              <div style="margin-top:4px;color:${BRAND.ink};font-size:13px;font-weight:600;">No card submitted for The Open</div>
+              <div style="margin-top:2px;color:${BRAND.dim};font-size:12px;">6/11 career · 54.5% Call Rate</div>
+            </td></tr>
+          </table>`;
+        const courseBlock = `
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:8px 0 0;background:${BRAND.creamSoft};border:1px solid ${BRAND.rule};border-radius:8px;">
+            <tr><td style="padding:14px 16px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+              <div style="color:${BRAND.dim};font-size:10px;text-transform:uppercase;letter-spacing:0.18em;font-weight:600;">Course</div>
+              <div style="color:${BRAND.ink};font-size:14px;font-weight:600;margin-top:2px;">${major.course} · ${major.city}</div>
+              <div style="color:${BRAND.dim};font-size:10px;text-transform:uppercase;letter-spacing:0.18em;font-weight:600;margin-top:10px;">First tee</div>
+              <div style="color:${BRAND.ink};font-size:14px;font-weight:600;margin-top:2px;">${major.teeTimeLabel}</div>
+            </td></tr>
+          </table>`;
         html = emailHtml({
           preheader:  `Picks for ${major.name} are open — make yours.`,
           heading:    `Picks open: ${major.short}`,
           intro:      `The field is set for <strong>${major.name}</strong> at ${major.course}. Lock in your four starters and two bench before first tee on ${major.teeTimeLabel}.`,
           ctaLabel:   "Make your picks",
           ctaUrl,
-          bodyHtml:   "",
+          bodyHtml:   `${courseBlock}${mockBrief}`,
           footerNote: "You're getting this because Picks Open notifications are on. Manage in Settings.",
         });
         break;
@@ -2247,13 +2526,40 @@ app.get("/api/admin/email-preview", async (req, res) => {
       case "round_wrap": {
         const round = Number(req.query.round) || 2;
         const ctaUrl = `${FRONTEND_URL}/?utm_source=email&utm_campaign=round_wrap&utm_content=${major.id}`;
+        // Mock enriched body — league standings + Club Championship + CC.
+        const mockBody = `
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:18px 0 0;background:${BRAND.creamSoft};border:1px solid ${BRAND.rule};border-radius:8px;">
+            <tr><td style="padding:14px 16px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+              <div style="color:${BRAND.dim};font-size:10px;text-transform:uppercase;letter-spacing:0.18em;font-weight:600;">${major.short} standings · your leagues</div>
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-top:6px;">
+                <tr><td style="padding:6px 0;"><span style="color:${BRAND.ink};font-size:13px;font-weight:600;">Experts League</span><span style="color:${BRAND.dim};font-size:11px;margin-left:8px;">#4 of 5</span></td><td style="padding:6px 0;text-align:right;"><span style="color:${BRAND.ink};font-size:13px;font-weight:700;">$1.43M</span><span style="color:${BRAND.dim};font-size:11px;margin-left:6px;">$700K back</span></td></tr>
+                <tr><td style="padding:6px 0;"><span style="color:${BRAND.ink};font-size:13px;font-weight:600;">Keim Boys</span><span style="color:${BRAND.dim};font-size:11px;margin-left:8px;">#5 of 6</span></td><td style="padding:6px 0;text-align:right;"><span style="color:${BRAND.ink};font-size:13px;font-weight:700;">$1.43M</span><span style="color:${BRAND.dim};font-size:11px;margin-left:6px;">$1.1M back</span></td></tr>
+              </table>
+            </td></tr>
+          </table>
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:18px 0 0;background:${BRAND.creamSoft};border:1px solid ${BRAND.rule};border-radius:8px;">
+            <tr><td style="padding:14px 16px;">
+              <div style="color:${BRAND.dim};font-size:10px;text-transform:uppercase;letter-spacing:0.18em;font-weight:600;">Club Championship</div>
+              <div style="margin-top:4px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+                <span style="color:${BRAND.ink};font-size:18px;font-weight:700;">$1.43M</span>
+                <span style="color:${BRAND.dim};font-size:13px;margin-left:6px;">#7 of 14</span>
+              </div>
+            </td></tr>
+          </table>
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:18px 0 0;background:${BRAND.creamSoft};border:1px solid ${BRAND.rule};border-radius:8px;">
+            <tr><td style="padding:14px 16px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+              <div style="color:${BRAND.dim};font-size:10px;text-transform:uppercase;letter-spacing:0.18em;font-weight:600;">Caddie's Call</div>
+              <div style="margin-top:4px;color:${BRAND.ink};font-size:13px;font-weight:600;">11/11 answered for ${major.short}</div>
+              <div style="margin-top:2px;color:${BRAND.dim};font-size:12px;">6/11 career · 54.5% Call Rate</div>
+            </td></tr>
+          </table>`;
         html = emailHtml({
           preheader:  `${major.short} R${round} in the books — your Money List update.`,
           heading:    `R${round} wrap · ${major.short}`,
           intro:      `Round ${round} at <strong>${major.course}</strong> is complete. Here's how your team stacks up${round === 2 ? " after the cut" : ""}.`,
           ctaLabel:   "Open the Money List",
           ctaUrl,
-          bodyHtml:   `<p style="margin:12px 0 0;">Your team: <strong>$1,432,596</strong> projected · rank 7 of 14</p>`,
+          bodyHtml:   mockBody,
           footerNote: "Round wrap digests fire after each round completes. Manage in Settings.",
         });
         break;
