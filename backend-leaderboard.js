@@ -1605,43 +1605,39 @@ function renderClubChampBlock({ rank, fieldSize, total, roster, round }) {
 // in-memory if the DB is unavailable.
 async function teamTotalForMajor(starters, majorId) {
   if (!starters?.length) return 0;
-  // Resolve each gid → dg_id. GID_TO_DGID map may be cold; if a gid comes
-  // in synthetic "dg-12345" form we can pull the dgId straight from it.
-  const dgIds = [];
-  for (const gid of starters) {
-    if (!gid) continue;
-    if (typeof gid === "string" && gid.startsWith("dg-")) {
-      const n = parseInt(gid.slice(3), 10);
-      if (!isNaN(n)) dgIds.push(n);
-      continue;
+  // Source of truth: the exact same buildSnapshotLeaderboard() output that
+  // /api/leaderboard/:majorId returns and the site's Leaderboard tab reads
+  // from. Using anything else drifts email away from site — that's the bug
+  // Austin hit ($6.7M email vs $14.7M site). Now: email = site by construction.
+  const lb = buildSnapshotLeaderboard(majorId);
+  const lookup = (gid) => {
+    if (!gid) return null;
+    // Primary: exact gid the site uses (short slug or dg-XXX synthetic).
+    if (lb[gid]) return lb[gid];
+    // Cold-boot fallback: gid is a short slug but GID_TO_DGID hadn't mapped
+    // it yet when the leaderboard was built. Try the dg-XXX key via the
+    // reverse mapping.
+    if (typeof gid === "string" && !gid.startsWith("dg-")) {
+      const dgId = GID_TO_DGID.get(gid);
+      if (dgId && lb[`dg-${dgId}`]) return lb[`dg-${dgId}`];
     }
-    const n = GID_TO_DGID.get(gid);
-    if (n) dgIds.push(n);
-  }
-  if (dgIds.length === 0) return 0;
-  // Preferred path: query the persistent snapshot table.
-  if (pool) {
-    try {
-      const { rows } = await pool.query(
-        `SELECT dg_id, MAX(COALESCE(final_money, proj_money)) AS money
-           FROM round_snapshots
-          WHERE major_id = $1 AND dg_id = ANY($2::bigint[])
-          GROUP BY dg_id`,
-        [majorId, dgIds]
-      );
-      let total = 0;
-      for (const r of rows) total += Number(r.money) || 0;
-      if (total > 0) return total;
-    } catch (_) { /* fall through to in-memory */ }
-  }
-  // Fallback: in-memory SNAPSHOTS.
-  const snaps = SNAPSHOTS[majorId] || {};
+    return null;
+  };
+  const moneyFor = (e) => {
+    if (!e) return 0;
+    if (e.status === "mc" || e.status === "wd" || e.status === "dfl") return 0;
+    // Same fallback order as the frontend's golferTotal().
+    if (e.finalMoney != null) return Number(e.finalMoney) || 0;
+    if (e.r4 != null)         return Number(e.r4)         || 0;
+    if (e.r3 != null)         return Number(e.r3)         || 0;
+    if (e.projMoney != null && e.projMoney > 0) return Number(e.projMoney) || 0;
+    if (e.r2 != null)         return Number(e.r2)         || 0;
+    if (e.r1 != null)         return Number(e.r1)         || 0;
+    return 0;
+  };
   let total = 0;
-  for (const dgId of dgIds) {
-    const s = snaps[dgId] || {};
-    const latest = s[4] || s[3] || s[2] || s[1];
-    if (!latest) continue;
-    total += latest.finalMoney ?? latest.projMoney ?? 0;
+  for (const gid of starters) {
+    total += moneyFor(lookup(gid));
   }
   return total;
 }
@@ -5165,6 +5161,49 @@ app.get("/api/picks", requireAuth, async (req, res) => {
       };
     }
     res.json(out);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET /api/played-golfers?leagueId=X — authoritative list of golfers the
+// authenticated user has already used (starters + subbed-in) in past majors
+// in this league. Frontend uses this to lock those players out of the
+// picker for upcoming majors. Bypasses the team_id-drift bug where the
+// picker's lockedFromOthers logic misses picks saved under a different
+// team_id (e.g. Keim Boys where team_id conventions differ from Experts).
+app.get("/api/played-golfers", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  try {
+    const leagueId = await resolveLeagueId(req.user.id, req.query.leagueId);
+    if (leagueId == null) return res.status(403).json({ error: "not a member of that league" });
+    // The authoritative team_id for this user in this league (whatever the
+    // pick was actually saved under). This is what protects against drift.
+    const teamId = await getUserTeamId(req.user.id, leagueId);
+    if (!teamId) return res.json({ played: [] });
+    const { rows } = await pool.query(
+      `SELECT major_id, starters, subs FROM picks WHERE league_id = $1 AND team_id = $2`,
+      [leagueId, teamId]
+    );
+    // A golfer is "played" (and therefore locked for the rest of the season)
+    // if they were a starter OR were subbed in during any PAST major. Bench
+    // players who were never subbed in stay available. Current/upcoming
+    // majors don't lock — those slots can still be edited.
+    const now = new Date();
+    const isPast = (mid) => {
+      const meta = MAJORS_META[mid];
+      if (!meta?.lastFinish) return false;
+      return new Date(meta.lastFinish) < now;
+    };
+    const played = new Set();
+    for (const r of rows) {
+      if (!isPast(r.major_id)) continue;
+      const starters = Array.isArray(r.starters) ? r.starters : [];
+      const subs     = Array.isArray(r.subs)     ? r.subs     : [];
+      for (const g of starters) if (g) played.add(g);
+      for (const s of subs)     if (s?.in) played.add(s.in);
+    }
+    res.json({ played: [...played] });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
