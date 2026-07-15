@@ -811,9 +811,56 @@ initSchema()
 // Helper: load all persisted snapshots into the in-memory SNAPSHOTS map on boot.
 // Keeps the rest of the codebase unchanged — SNAPSHOTS is still the cache,
 // the DB is just the durable source of truth.
+// Persist the gid ↔ dg_id name mapping so cold Railway boots can still
+// translate short gids (like "burns", "henley") to DataGolf IDs. Written
+// every time we successfully match a player. Loaded into memory at boot.
+async function persistGolferMap(gid, dgId, playerName) {
+  if (!pool || !gid || !dgId) return;
+  try {
+    await pool.query(
+      `CREATE TABLE IF NOT EXISTS golfer_id_map (
+         gid        TEXT PRIMARY KEY,
+         dg_id      BIGINT NOT NULL,
+         name       TEXT,
+         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+       )`
+    );
+    await pool.query(
+      `INSERT INTO golfer_id_map (gid, dg_id, name)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (gid) DO UPDATE SET dg_id = EXCLUDED.dg_id, name = EXCLUDED.name, updated_at = NOW()`,
+      [gid, dgId, playerName || null]
+    );
+  } catch (_) { /* best-effort */ }
+}
+
+async function loadGolferMapFromDB() {
+  if (!pool) return 0;
+  try {
+    await pool.query(
+      `CREATE TABLE IF NOT EXISTS golfer_id_map (
+         gid        TEXT PRIMARY KEY,
+         dg_id      BIGINT NOT NULL,
+         name       TEXT,
+         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+       )`
+    );
+    const { rows } = await pool.query(`SELECT gid, dg_id, name FROM golfer_id_map`);
+    for (const r of rows) {
+      GID_TO_DGID.set(r.gid, Number(r.dg_id));
+      DGID_TO_GID.set(Number(r.dg_id), r.gid);
+      if (r.name) GID_TO_NAME.set(r.gid, r.name);
+    }
+    return rows.length;
+  } catch (_) { return 0; }
+}
+
 async function loadSnapshotsFromDB() {
   if (!pool) return;
   try {
+    // First hydrate the name maps so short gids can be translated on cold boot.
+    const nameCount = await loadGolferMapFromDB();
+    if (nameCount > 0) console.log(`✓  loaded ${nameCount} golfer name mappings from DB`);
     const { rows } = await pool.query(`SELECT * FROM round_snapshots`);
     for (const r of rows) {
       SNAPSHOTS[r.major_id] = SNAPSHOTS[r.major_id] || {};
@@ -3385,6 +3432,7 @@ function hydrateNameMaps(players) {
       DGID_TO_GID.set(p.dg_id, gid);
       GID_TO_DGID.set(gid, p.dg_id);
       GID_TO_NAME.set(gid, prettyName(p.player_name));
+      persistGolferMap(gid, p.dg_id, prettyName(p.player_name));
     }
   }
 }
@@ -4421,12 +4469,13 @@ async function backfillRoundsFromDG(majorId, rounds = [1, 2, 3]) {
           ts: Date.now(),
         };
         count++;
-        // Hydrate reverse maps from backfill players too.
+        // Hydrate reverse maps from backfill players too, and persist.
         const gid = matchGolferId(p.player_name);
         if (gid) {
           DGID_TO_GID.set(p.dg_id, gid);
           GID_TO_DGID.set(gid, p.dg_id);
           GID_TO_NAME.set(gid, prettyName(p.player_name));
+          persistGolferMap(gid, p.dg_id, prettyName(p.player_name));
         }
       }
       BACKFILLED.add(marker);
@@ -6432,7 +6481,28 @@ app.listen(PORT, async () => {
   console.log(`   CORS allowed: ${ALLOWED_ORIGINS.join(", ")}`);
   // Wait for the schema to be ready, then rehydrate snapshots from DB.
   // initSchema started at boot; this just gives it a moment if it's racing.
-  setTimeout(() => loadSnapshotsFromDB(), 1000);
+  setTimeout(async () => {
+    await loadSnapshotsFromDB();
+    // If the golfer_id_map came back sparse, force-hydrate by hitting DG's
+    // field endpoints for each major so cold Railway boots self-heal.
+    if (GID_TO_DGID.size < 50) {
+      console.log("golfer map sparse — hydrating from DataGolf");
+      for (const mid of Object.keys(MAJORS_META)) {
+        try {
+          const inPlay = await fetchDG("/preds/in-play", { tour: "pga", odds_format: "percent" }).catch(() => null);
+          const players = Array.isArray(inPlay?.data) ? inPlay.data : Array.isArray(inPlay) ? inPlay : [];
+          hydrateNameMaps(players);
+        } catch (_) {}
+        try {
+          const field = await fetchDG("/field-updates", { tour: "pga" }).catch(() => null);
+          const fList = Array.isArray(field?.field) ? field.field : Array.isArray(field?.data) ? field.data : [];
+          hydrateNameMaps(fList);
+        } catch (_) {}
+        break; // one pass is enough — same players show up in every response
+      }
+      console.log(`✓  hydrated ${GID_TO_DGID.size} golfer mappings`);
+    }
+  }, 1000);
   // Notification sweep — runs once 30s after boot (so initSchema has settled)
   // and then every hour. Each notification type has its own day-of-week /
   // hour-of-day gate; the hourly sweep is what makes those gates fire
