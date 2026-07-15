@@ -946,6 +946,37 @@ const BRAND = {
   white:     "#ffffff",
 };
 
+// Reachable URL for the OnlyMajors logo. Served by /api/logo.png below.
+// Falls back to a base64-encoded inline SVG placeholder if the API URL
+// env var isn't set — never breaks the email render.
+const LOGO_URL = `${(process.env.API_URL || "https://api.onlymajors.com").replace(/\/$/, "")}/api/logo.png`;
+
+// Cache the logo PNG bytes at boot so /api/logo.png is a memory read, not
+// a disk hit per request. File is shipped alongside this .js in the repo.
+let LOGO_BYTES = null;
+try {
+  const fs = require("fs");
+  const path = require("path");
+  const p = path.join(__dirname, "logo-mark.png");
+  if (fs.existsSync(p)) {
+    LOGO_BYTES = fs.readFileSync(p);
+    console.log(`✓  logo-mark.png loaded (${LOGO_BYTES.length} bytes)`);
+  } else {
+    console.warn("⚠  logo-mark.png not found — email header will use placeholder");
+  }
+} catch (e) {
+  console.warn("logo load failed:", e.message);
+}
+// Public route — no auth. Cached for a day since the logo doesn't change.
+app.get("/api/logo.png", (req, res) => {
+  if (!LOGO_BYTES) return res.status(404).send("logo unavailable");
+  res.set({
+    "Content-Type":  "image/png",
+    "Cache-Control": "public, max-age=86400, immutable",
+  });
+  res.send(LOGO_BYTES);
+});
+
 function emailHtml({ preheader = "", heading, intro, bodyHtml = "", ctaLabel, ctaUrl, footerNote }) {
   const stack = "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif";
   return `<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
@@ -966,14 +997,7 @@ function emailHtml({ preheader = "", heading, intro, bodyHtml = "", ctaLabel, ct
         <table role="presentation" width="560" cellpadding="0" cellspacing="0" border="0" style="background:${BRAND.white};border-radius:14px;max-width:560px;width:100%;box-shadow:0 1px 3px rgba(43,69,53,0.06),0 8px 24px rgba(43,69,53,0.06);overflow:hidden;">
           <tr>
             <td style="background:${BRAND.creamSoft};padding:24px 32px 22px;text-align:center;border-bottom:1px solid ${BRAND.rule};">
-              <div style="margin:0 auto 10px;line-height:0;">
-                <svg xmlns="http://www.w3.org/2000/svg" width="52" height="52" viewBox="0 0 56 56" style="display:inline-block;vertical-align:middle;">
-                  <circle cx="28" cy="28" r="26" fill="${BRAND.green}" stroke="${BRAND.greenInk}" stroke-width="1"/>
-                  <path d="M6 34 Q28 26 50 34 L50 46 Q28 42 6 46 Z" fill="${BRAND.greenInk}" opacity="0.55"/>
-                  <line x1="20" y1="12" x2="20" y2="42" stroke="${BRAND.cream}" stroke-width="1.6" stroke-linecap="round"/>
-                  <path d="M20 14 L36 18 L20 22 Z" fill="${BRAND.cream}"/>
-                </svg>
-              </div>
+              <img src="${LOGO_URL}" alt="OnlyMajors" width="56" height="56" style="display:inline-block;width:56px;height:56px;border:0;margin:0 auto 10px;"/>
               <div style="color:${BRAND.green};font-size:22px;font-weight:800;letter-spacing:-0.02em;line-height:1;">OnlyMajors</div>
               <div style="color:${BRAND.dim};font-size:10px;letter-spacing:0.22em;text-transform:uppercase;margin-top:6px;">Fantasy golf when it counts</div>
             </td>
@@ -2468,6 +2492,41 @@ app.get("/api/admin/email-preview", async (req, res) => {
     switch (kind) {
       case "picks_open": {
         const ctaUrl = `${FRONTEND_URL}/?utm_source=email&utm_campaign=picks_open&utm_content=${major.id}`;
+        // ?userId=N → render using the same helpers the real send uses,
+        // reading THAT user's actual DB state. Falls through to mock data
+        // if userId isn't provided.
+        const userId = req.query.userId ? Number(req.query.userId) : null;
+        if (userId && Number.isFinite(userId)) {
+          const majorOrder = ["masters","pga","usopen","open"];
+          const idx = majorOrder.indexOf(major.id);
+          const prevMajorId = idx > 0 ? majorOrder[idx - 1] : null;
+          const priorLeagueBlock = prevMajorId
+            ? await buildLeagueStandingsBlock(userId, prevMajorId, {
+                label: `Coming off ${MAJORS_META[prevMajorId]?.short} · your standings`,
+              })
+            : "";
+          const weatherBlock    = await buildWeatherBlock(major.id);
+          const caddieCallBlock = await buildCaddieCallBlock(userId, major.id);
+          const courseBlock = `
+            <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:8px 0 0;background:${BRAND.creamSoft};border:1px solid ${BRAND.rule};border-radius:8px;">
+              <tr><td style="padding:14px 16px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+                <div style="color:${BRAND.dim};font-size:10px;text-transform:uppercase;letter-spacing:0.18em;font-weight:600;">Course</div>
+                <div style="color:${BRAND.ink};font-size:14px;font-weight:600;margin-top:2px;">${major.course} · ${major.city}</div>
+                <div style="color:${BRAND.dim};font-size:10px;text-transform:uppercase;letter-spacing:0.18em;font-weight:600;margin-top:10px;">First tee</div>
+                <div style="color:${BRAND.ink};font-size:14px;font-weight:600;margin-top:2px;">${major.teeTimeLabel}</div>
+              </td></tr>
+            </table>`;
+          html = emailHtml({
+            preheader:  `Picks for ${major.name} are open — make yours.`,
+            heading:    `Picks open: ${major.short}`,
+            intro:      `The field is set for <strong>${major.name}</strong> at ${major.course}. Lock in your four starters and two bench before first tee on ${major.teeTimeLabel}.`,
+            ctaLabel:   "Make your picks",
+            ctaUrl,
+            bodyHtml:   `${courseBlock}${priorLeagueBlock || ""}${weatherBlock || ""}${caddieCallBlock || ""}`,
+            footerNote: "You're getting this because Picks Open notifications are on. Manage in Settings.",
+          });
+          break;
+        }
         // Mock position brief + LIVE weather fetch for the target major.
         // Real send uses buildLeagueStandingsBlock + buildWeatherBlock — the
         // preview shows those blocks with representative mock/live data.
@@ -2598,6 +2657,62 @@ app.get("/api/admin/email-preview", async (req, res) => {
   } catch (err) {
     console.error("[email-preview] failed:", err);
     res.status(500).send(err.message);
+  }
+});
+
+// Self-send: renders a real notification template with the CALLER's live
+// data and drops it in their inbox. Great for reviewing what a member
+// actually sees. Doesn't touch notification_log so it won't block the
+// normal send. Only sends to the authenticated caller.
+app.post("/api/admin/self-send", requireAuth, async (req, res) => {
+  if (!requireDb(res)) return;
+  const kind    = String(req.query.kind    || req.body?.kind    || "picks_open");
+  const majorId = String(req.query.majorId || req.body?.majorId || "open");
+  const meta    = MAJORS_META[majorId];
+  if (!meta) return res.status(404).json({ error: `unknown major: ${majorId}` });
+  const major = { id: majorId, ...meta };
+  try {
+    const { rows } = await pool.query(`SELECT id, email, display_name FROM users WHERE id = $1`, [req.user.id]);
+    const user = rows[0];
+    if (!user?.email) return res.status(400).json({ error: "no email on caller" });
+    let result;
+    if (kind === "picks_open") {
+      const majorOrder = ["masters","pga","usopen","open"];
+      const idx = majorOrder.indexOf(majorId);
+      const prevMajorId = idx > 0 ? majorOrder[idx - 1] : null;
+      const priorLeagueBlock = prevMajorId
+        ? await buildLeagueStandingsBlock(user.id, prevMajorId, {
+            label: `Coming off ${MAJORS_META[prevMajorId]?.short} · your standings`,
+          })
+        : "";
+      const caddieCallBlock = await buildCaddieCallBlock(user.id, majorId);
+      const weatherBlock    = await buildWeatherBlock(majorId);
+      const brief = `${priorLeagueBlock || ""}${weatherBlock || ""}${caddieCallBlock || ""}`;
+      result = await sendPicksOpenEmail(
+        { email: user.email, displayName: user.display_name }, major, brief);
+    } else if (kind === "round_wrap") {
+      const round = Number(req.query.round || req.body?.round) || 4;
+      const leagueLines     = await buildLeagueStandingsBlock(user.id, majorId, {
+        label: `${meta.short} standings · your leagues`,
+      });
+      const clubChampBlock  = await buildClubChampBlock(user.id, majorId, round);
+      const caddieCallBlock = await buildCaddieCallBlock(user.id, majorId);
+      const enrichedBody    = `${leagueLines || ""}${clubChampBlock || ""}${caddieCallBlock || ""}`;
+      result = await sendRoundWrapEmail(
+        { email: user.email, displayName: user.display_name }, major, round, enrichedBody, "", "");
+    } else if (kind === "wed_reminder") {
+      result = await sendWedReminderEmail(
+        { email: user.email, displayName: user.display_name }, major, "2 starters and 1 bench");
+    } else if (kind === "sat_reminder") {
+      result = await sendSatReminderEmail(
+        { email: user.email, displayName: user.display_name }, major);
+    } else {
+      return res.status(400).json({ error: `unsupported kind: ${kind}` });
+    }
+    res.json({ ok: true, kind, to: user.email, id: result?.id || null });
+  } catch (err) {
+    console.error("[self-send] failed:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
