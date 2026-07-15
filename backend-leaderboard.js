@@ -1181,7 +1181,7 @@ async function checkPicksOpenForMajor(majorId) {
       WHERE COALESCE(np.picks_open, true) = true
         AND nl.user_id IS NULL
         AND u.email IS NOT NULL
-        AND (l.included_majors IS NULL OR $1 = ANY(l.included_majors))`,
+        AND (l.included_majors IS NULL OR l.included_majors ? $1)`,
     [majorId]
   );
 
@@ -1268,7 +1268,7 @@ async function checkWedReminderForMajor(majorId) {
       WHERE COALESCE(np.wed_reminder, true) = true
         AND nl.user_id IS NULL
         AND u.email IS NOT NULL
-        AND (l.included_majors IS NULL OR $1 = ANY(l.included_majors))`,
+        AND (l.included_majors IS NULL OR l.included_majors ? $1)`,
     [majorId]
   );
   const results = { sent: 0, failed: 0, total: 0 };
@@ -1365,7 +1365,7 @@ async function checkRoundWrapForMajor(majorId) {
       WHERE COALESCE(np.round_wrap, true) = true
         AND nl.user_id IS NULL
         AND u.email IS NOT NULL
-        AND (l.included_majors IS NULL OR $1 = ANY(l.included_majors))`,
+        AND (l.included_majors IS NULL OR l.included_majors ? $1)`,
     [majorId, triggerRound]
   );
   const results = { sent: 0, failed: 0, total: recipients.length, round: triggerRound };
@@ -1590,7 +1590,7 @@ async function checkSatReminderForMajor(majorId) {
       WHERE COALESCE(np.sat_reminder, true) = true
         AND nl.user_id IS NULL
         AND u.email IS NOT NULL
-        AND (l.included_majors IS NULL OR $1 = ANY(l.included_majors))`,
+        AND (l.included_majors IS NULL OR l.included_majors ? $1)`,
     [majorId]
   );
   const results = { sent: 0, failed: 0, total: 0 };
