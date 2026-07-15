@@ -249,6 +249,16 @@ async function initSchema() {
   // some prior migration is silently failing and these never get created,
   // which breaks the entire email pipeline (test endpoint + scheduled
   // notifications both query notification_log). Idempotent.
+  //
+  // Each statement in its own try/catch so a single failure doesn't kill
+  // the rest. Previously the entire block was wrapped, so gen_random_bytes
+  // (which requires pgcrypto, not installed on all Railway PGs) failed the
+  // prefs table CREATE and cascaded to skip notification_log entirely.
+  // Fixed by (1) attempting to install pgcrypto, (2) using md5(random())
+  // as fallback if the extension isn't available, (3) isolating statements.
+  try {
+    await pool.query(`CREATE EXTENSION IF NOT EXISTS pgcrypto`);
+  } catch (_) { /* no permission — fall through to md5 fallback */ }
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS notification_prefs (
@@ -258,10 +268,15 @@ async function initSchema() {
         round_wrap     BOOLEAN NOT NULL DEFAULT true,
         mc_alert       BOOLEAN NOT NULL DEFAULT true,
         sat_reminder   BOOLEAN NOT NULL DEFAULT true,
-        unsub_token    TEXT NOT NULL DEFAULT encode(gen_random_bytes(16), 'hex'),
+        unsub_token    TEXT NOT NULL DEFAULT md5(random()::text || clock_timestamp()::text),
         updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
       )
     `);
+    console.log("✓  notification_prefs ensured");
+  } catch (err) {
+    console.error("⚠  notification_prefs create failed:", err.message);
+  }
+  try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS notification_log (
         user_id    BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -272,23 +287,29 @@ async function initSchema() {
         message_id TEXT
       )
     `);
+    console.log("✓  notification_log ensured");
+  } catch (err) {
+    console.error("⚠  notification_log create failed:", err.message);
+  }
+  try {
+    // COALESCE inside index expression needs to be wrapped in parens.
     await pool.query(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_notification_log_uniq
-        ON notification_log (user_id, kind, major_id, COALESCE(round, 0))
+        ON notification_log (user_id, kind, major_id, (COALESCE(round, 0)))
     `);
     await pool.query(`
       CREATE INDEX IF NOT EXISTS idx_notification_log_user ON notification_log (user_id)
     `);
-    // Seed default prefs (all-on) for any existing user without a row.
+  } catch (err) {
+    console.error("⚠  notification_log indexes failed:", err.message);
+  }
+  try {
     await pool.query(`
       INSERT INTO notification_prefs (user_id)
       SELECT u.id FROM users u
        WHERE NOT EXISTS (SELECT 1 FROM notification_prefs np WHERE np.user_id = u.id)
     `);
-    console.log("✓  notification_* tables ensured (pre-flight)");
-  } catch (err) {
-    console.error("⚠  notification pre-flight migration failed:", err.message);
-  }
+  } catch (_) { /* prefs seed is best-effort */ }
 
   // Pre-flight: Caddie's Call tables. 19th-Hole side game where members
   // answer 5 auto-generated prop questions per major. Phase 1: schema only,
