@@ -1228,17 +1228,14 @@ async function checkPicksOpenForMajor(majorId) {
     const reserved = await reserveNotification({ userId: u.id, kind: "picks_open", majorId });
     if (!reserved) continue;
     try {
-      // Position brief: standings from the previous major + career CC line +
-      // tournament-week weather forecast (Open-Meteo, free public API).
-      // Gives members context on how they're doing before locking in picks.
-      const priorLeagueBlock = prevMajorId
-        ? await buildLeagueStandingsBlock(u.id, prevMajorId, {
-            label: `Coming off ${MAJORS_META[prevMajorId]?.short} · your standings`,
-          })
-        : "";
+      // Position brief: cumulative SEASON standings (mirrors the site's
+      // Money List) + career CC line + tournament-week weather.
+      const seasonBlock     = await buildLeagueSeasonStandingsBlock(u.id, {
+        label: `Season standings · your leagues`,
+      });
       const caddieCallBlock = await buildCaddieCallBlock(u.id, majorId);
       const weatherBlock    = await buildWeatherBlock(majorId);
-      const positionBrief = `${priorLeagueBlock || ""}${weatherBlock || ""}${caddieCallBlock || ""}`;
+      const positionBrief = `${seasonBlock || ""}${weatherBlock || ""}${caddieCallBlock || ""}`;
       const { id } = await sendPicksOpenEmail({ email: u.email, displayName: u.display_name }, { id: majorId, ...meta }, positionBrief);
       if (id) {
         await pool.query(
@@ -1597,6 +1594,105 @@ async function teamTotalForMajor(starters, majorId) {
     total += latest.finalMoney ?? latest.projMoney ?? 0;
   }
   return total;
+}
+
+// Season-to-date per-league standings for a user. Mirrors what the site's
+// Money List renders — cumulative earnings across every completed major in
+// each league. Used by picks_open to give members context before locking
+// in the next lineup.
+async function buildLeagueSeasonStandingsBlock(userId, opts = {}) {
+  const label = opts.label || `Season standings · your leagues`;
+  try {
+    const { rows: myLeagues } = await pool.query(
+      `SELECT l.id, l.name,
+              lm.team_id AS my_team_id,
+              u.display_name, u.first_name
+         FROM leagues l
+         JOIN league_members lm ON lm.league_id = l.id
+         JOIN users u ON u.id = lm.user_id
+        WHERE lm.user_id = $1`,
+      [userId]
+    );
+    if (myLeagues.length === 0) return "";
+    // Completed majors that count toward the season.
+    const completedMajors = Object.keys(MAJORS_META).filter(mid => {
+      const meta = MAJORS_META[mid];
+      return meta?.lastFinish && new Date(meta.lastFinish) < new Date();
+    });
+    if (completedMajors.length === 0) return "";
+    const perLeague = [];
+    for (const lg of myLeagues) {
+      // All picks in this league across every completed major.
+      const { rows: picks } = await pool.query(
+        `SELECT team_id, major_id, starters FROM picks
+          WHERE league_id = $1 AND major_id = ANY($2::text[])`,
+        [lg.id, completedMajors]
+      );
+      if (picks.length === 0) continue;
+      // Sum per-team cumulative across all completed majors.
+      const totals = {};
+      for (const p of picks) {
+        const starters = Array.isArray(p.starters) ? p.starters : [];
+        const t = await teamTotalForMajor(starters, p.major_id);
+        totals[p.team_id] = (totals[p.team_id] || 0) + t;
+      }
+      const ranked = Object.entries(totals)
+        .map(([teamId, total]) => ({ teamId, total }))
+        .sort((a, b) => b.total - a.total);
+      let rank = 0, prev = null;
+      ranked.forEach((r, i) => {
+        if (r.total !== prev) rank = i + 1;
+        r.rank = rank;
+        prev = r.total;
+      });
+      // Multi-format team lookup (handles legacy + user-created leagues).
+      const candidates = new Set();
+      if (lg.my_team_id)   candidates.add(String(lg.my_team_id).toLowerCase());
+      candidates.add(`lg${lg.id}-u${userId}`.toLowerCase());
+      if (lg.first_name)   candidates.add(lg.first_name.toLowerCase().trim());
+      if (lg.display_name) candidates.add(lg.display_name.toLowerCase().trim().split(/\s+/)[0]);
+      const me = ranked.find(r => r.teamId && candidates.has(String(r.teamId).toLowerCase()));
+      if (!me) continue;
+      perLeague.push({
+        leagueName: lg.name,
+        rank:       me.rank,
+        total:      me.total,
+        fieldSize:  ranked.length,
+        leader:     ranked[0],
+        behind:     me.rank === 1 ? 0 : (ranked[0].total - me.total),
+      });
+    }
+    if (perLeague.length === 0) return "";
+    const fmtM = (n) => n >= 1e6 ? `$${(n/1e6).toFixed(2)}M` : `$${Math.round(n/1000)}K`;
+    const rows = perLeague.map(l => `
+      <tr>
+        <td style="padding:6px 0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+          <span style="color:${BRAND.ink};font-size:13px;font-weight:600;">${l.leagueName}</span>
+          <span style="color:${BRAND.dim};font-size:11px;margin-left:8px;">#${l.rank} of ${l.fieldSize}</span>
+        </td>
+        <td style="padding:6px 0;text-align:right;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+          <span style="color:${BRAND.ink};font-size:13px;font-weight:700;">${fmtM(l.total)}</span>
+          ${l.rank === 1
+            ? `<span style="color:${BRAND.gold || '#8b6c00'};font-size:11px;margin-left:6px;">Leading</span>`
+            : `<span style="color:${BRAND.dim};font-size:11px;margin-left:6px;">${fmtM(l.behind)} back</span>`}
+        </td>
+      </tr>`).join("");
+    return `
+      <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin:18px 0 0;background:${BRAND.creamSoft};border:1px solid ${BRAND.rule};border-radius:8px;">
+        <tr><td style="padding:14px 16px;">
+          <div style="color:${BRAND.dim};font-size:10px;text-transform:uppercase;letter-spacing:0.18em;font-weight:600;">${label}</div>
+          <table role="presentation" cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-top:6px;">
+            ${rows}
+          </table>
+          <div style="margin-top:8px;color:${BRAND.dim};font-size:11px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;">
+            Cumulative across ${completedMajors.length} completed ${completedMajors.length === 1 ? "major" : "majors"}
+          </div>
+        </td></tr>
+      </table>`;
+  } catch (err) {
+    console.error("[league_season_standings_block] failed:", err.message);
+    return "";
+  }
 }
 
 // Per-league standings for this user for a single major. Returns HTML with
@@ -2541,14 +2637,9 @@ app.get("/api/admin/email-preview", async (req, res) => {
         // if userId isn't provided.
         const userId = req.query.userId ? Number(req.query.userId) : null;
         if (userId && Number.isFinite(userId)) {
-          const majorOrder = ["masters","pga","usopen","open"];
-          const idx = majorOrder.indexOf(major.id);
-          const prevMajorId = idx > 0 ? majorOrder[idx - 1] : null;
-          const priorLeagueBlock = prevMajorId
-            ? await buildLeagueStandingsBlock(userId, prevMajorId, {
-                label: `Coming off ${MAJORS_META[prevMajorId]?.short} · your standings`,
-              })
-            : "";
+          const seasonBlock     = await buildLeagueSeasonStandingsBlock(userId, {
+            label: `Season standings · your leagues`,
+          });
           const weatherBlock    = await buildWeatherBlock(major.id);
           const caddieCallBlock = await buildCaddieCallBlock(userId, major.id);
           const courseBlock = `
@@ -2566,7 +2657,7 @@ app.get("/api/admin/email-preview", async (req, res) => {
             intro:      `The field is set for <strong>${major.name}</strong> at ${major.course}. Lock in your four starters and two bench before first tee on ${major.teeTimeLabel}.`,
             ctaLabel:   "Make your picks",
             ctaUrl,
-            bodyHtml:   `${courseBlock}${priorLeagueBlock || ""}${weatherBlock || ""}${caddieCallBlock || ""}`,
+            bodyHtml:   `${courseBlock}${seasonBlock || ""}${weatherBlock || ""}${caddieCallBlock || ""}`,
             footerNote: "You're getting this because Picks Open notifications are on. Manage in Settings.",
           });
           break;
@@ -2721,17 +2812,12 @@ app.post("/api/admin/self-send", requireAuth, async (req, res) => {
     if (!user?.email) return res.status(400).json({ error: "no email on caller" });
     let result;
     if (kind === "picks_open") {
-      const majorOrder = ["masters","pga","usopen","open"];
-      const idx = majorOrder.indexOf(majorId);
-      const prevMajorId = idx > 0 ? majorOrder[idx - 1] : null;
-      const priorLeagueBlock = prevMajorId
-        ? await buildLeagueStandingsBlock(user.id, prevMajorId, {
-            label: `Coming off ${MAJORS_META[prevMajorId]?.short} · your standings`,
-          })
-        : "";
+      const seasonBlock     = await buildLeagueSeasonStandingsBlock(user.id, {
+        label: `Season standings · your leagues`,
+      });
       const caddieCallBlock = await buildCaddieCallBlock(user.id, majorId);
       const weatherBlock    = await buildWeatherBlock(majorId);
-      const brief = `${priorLeagueBlock || ""}${weatherBlock || ""}${caddieCallBlock || ""}`;
+      const brief = `${seasonBlock || ""}${weatherBlock || ""}${caddieCallBlock || ""}`;
       result = await sendPicksOpenEmail(
         { email: user.email, displayName: user.display_name }, major, brief);
     } else if (kind === "round_wrap") {
